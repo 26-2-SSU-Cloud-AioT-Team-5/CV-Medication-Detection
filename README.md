@@ -34,8 +34,14 @@ RPi 기기 내 추론은 ONNX Runtime을 쓴다. RPi OS는 64-bit여야 한다 (
   - 기기 쪽은 칸 ROI 자르기 → 리사이즈 → BGR→RGB → `/255`까지만 한다. 밝기 보정은 하지 않는다
   - mean/std 정규화 등 그 외 전처리는 **모델 안에 넣어서** export한다
 - 출력: 로짓 (sigmoid/softmax는 넣지 않는다). 둘 중 하나
-  - shape `(1, 1)`: "있음" 로짓 (`BCEWithLogitsLoss`로 학습한 경우)
+  - 로짓 1개, shape `(1,)` 또는 `(1, 1)`: "있음" 로짓 (`BCEWithLogitsLoss`로 학습한 경우. `architecture/model.py`의 `PillClassifier`)
   - shape `(1, 2)`: `[없음, 있음]` 로짓 (`CrossEntropyLoss`로 학습한 경우)
+
+학습 체크포인트는 `training/export_onnx.py`로 위 규격의 ONNX로 바꾼다. 체크포인트의 `normalization_mean/std`를 모델 안에 넣고, 변환 결과가 PyTorch와 같은지 확인까지 한다.
+
+```bash
+python -m training.export_onnx training/checkpoints/<실행>/best.pt   # -> 같은 폴더에 best.onnx
+```
 
 ## 할 일
 
