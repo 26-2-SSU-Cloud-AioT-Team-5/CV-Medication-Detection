@@ -7,7 +7,7 @@ camera:
   file_dir: samples/filled   # file 모드에서 읽을 샘플 폴더
 
 preprocess:
-  size: [128, 128]      # 리사이즈 (width, height)
+  size: [224, 224]      # 리사이즈 (width, height). model 백엔드는 학습 입력 크기와 같아야 함 (ResNet18 기본 224)
 
 # 칸별 ROI: [x, y, w, h] 픽셀. 아래는 임시값, 실제 카메라 고정 후 수정.
 # 칸 수만큼 항목 추가.
@@ -21,4 +21,11 @@ baseline:
   threshold: 0.5        # 기준 대비 차이 점수가 이 값보다 크면 알약 있음 (임시값, 사진 수집 후 조정)
 
 model:
-  path: null            # 모델 파일 경로 (추후)
+  path: null            # ResNet18 이진 분류 .onnx 파일 경로 (상대 경로는 저장소 루트 기준)
+  threshold: 0.5        # 알약 있음 확률이 이 값 이상이면 has_pill=True (실기기 평가 후 조정)
+
+mqtt:                   # 임시값, 서버 담당과 맞춘 뒤 수정. 계정은 MQTT_USERNAME/MQTT_PASSWORD 환경변수
+  host: localhost
+  port: 1883            # TLS 사용 시 보통 8883
+  tls: false            # 외부 브로커로 보낼 때는 true
+  topic: pillbox/pillbox-01/detect

@@ -3,7 +3,7 @@
 # config.yaml의 detector.backend 값으로 구현을 고른다.
 # - dummy    : 항상 has_pill=True, confidence=1.0 (연동용)
 # - baseline : 기준 이미지 비교 (baseline.py, 아직 stub)
-# - model    : 학습 모델 (model.py, 아직 stub)
+# - model    : 학습 모델 (model.py, ONNX Runtime)
 
 import time
 from dataclasses import dataclass
@@ -45,17 +45,17 @@ def detect(compartment_id: int) -> DetectResult:
     image = camera.capture(compartment_id, cfg["camera"])
     image = preprocess.crop_roi(image, cfg["compartments"][compartment_id]["roi"])
     image = preprocess.resize(image, tuple(cfg["preprocess"]["size"]))
-    image = preprocess.normalize_brightness(image)
 
     if backend == "baseline":
         from . import baseline
+        image = preprocess.normalize_brightness(image)  # 모델은 정규화를 자체적으로 하므로 baseline에만 적용
         has_pill, confidence = baseline.compare(
             compartment_id, image, cfg["baseline"]["threshold"]
         )
     else:
         from . import model
         has_pill, confidence = model.predict(
-            model.load_model(cfg["model"]["path"]), image
+            model.load_model(cfg["model"]["path"]), image, cfg["model"]["threshold"]
         )
 
     del image  

@@ -1,4 +1,7 @@
 opencv-python
 numpy
 PyYAML
+onnxruntime
+paho-mqtt
 pytest
+onnx          # 테스트용 (가짜 모델 생성)

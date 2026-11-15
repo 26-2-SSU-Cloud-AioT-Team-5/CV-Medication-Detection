@@ -14,8 +14,28 @@ pytest
 
 `detect(compartment_id) -> DetectResult(compartment_id, has_pill, confidence, captured_at)` 만 호출한다.
 시그니처와 필드는 고정. 백엔드는 `detector/config.yaml`의 `detector.backend` (`dummy` / `baseline` / `model`)로 바꾼다.
-기본 `dummy`는 항상 `has_pill=True, confidence=1.0`. `baseline`/`model`은 구현 전이라 `NotImplementedError`출력
+기본 `dummy`는 항상 `has_pill=True, confidence=1.0`. `baseline`과 카메라/전처리는 구현 전이라 `NotImplementedError`출력
 이미지는 디스크에 저장하지 않는다.
+
+서버 전송은 `detector.publisher.publish(detect(1))`로 한다. 브로커와 토픽은 `config.yaml`의 `mqtt`에서 정하고, QoS 1로 아래 JSON을 보낸다.
+
+```json
+{"compartment_id": 1, "has_pill": true, "confidence": 0.97, "captured_at": 1794214800.0}
+```
+
+`confidence`는 판정 결과에 대한 확신도다.
+
+## 모델 규격 (학습 → 배포)
+
+RPi 기기 내 추론은 ONNX Runtime을 쓴다. RPi OS는 64-bit여야 한다 (PyPI에 32-bit ARM용 `onnxruntime` 없음).
+
+- 모델: ResNet18 이진 분류. 파일은 `.onnx` 한 개, 경로는 `config.yaml`의 `model.path`
+- 입력: `float32`, `NCHW` (배치 1), **RGB 3채널**, 값 범위 0~1. 크기는 `preprocess.size` (기본 224×224)
+  - 기기 쪽은 칸 ROI 자르기 → 리사이즈 → BGR→RGB → `/255`까지만 한다. 밝기 보정은 하지 않는다
+  - mean/std 정규화 등 그 외 전처리는 **모델 안에 넣어서** export한다
+- 출력: 로짓 (sigmoid/softmax는 넣지 않는다). 둘 중 하나
+  - shape `(1, 1)`: "있음" 로짓 (`BCEWithLogitsLoss`로 학습한 경우)
+  - shape `(1, 2)`: `[없음, 있음]` 로짓 (`CrossEntropyLoss`로 학습한 경우)
 
 ## 할 일
 
@@ -25,11 +45,6 @@ pytest
 - [ ] `detector/baseline.py` — `register_baseline`, `compare` (OpenCV 기준 이미지 비교 판별)
 - [ ] 평가 스크립트 (신규) — `samples/empty`, `samples/filled`로 정확도 측정
 - [ ] `detector/config.yaml` — 칸별 ROI, 임계값 조정
-- [ ] (추후) `detector/model.py` — `load_model`, `predict` (규칙 기반이 부족할 때만)
+- [x] `detector/model.py` — `load_model`, `predict` (ONNX Runtime)
 
-## 작업 우선순위
 
-1. 뼈대 (완료)
-2. `camera.py` + 사진 수집
-3. `baseline.py` + 평가
-4. (선택) `model.py`
