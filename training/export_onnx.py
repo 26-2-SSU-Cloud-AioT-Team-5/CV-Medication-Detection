@@ -1,3 +1,4 @@
+# 학습 파트의 새 export 방식으로 교체 예정 (ResNet18 이진 분류 전용이라 칸별 개수 모델에는 맞지 않음)
 """학습 체크포인트(best.pt)를 RPi용 ONNX로 변환한다.
 
 ImageNet 정규화를 모델 안에 넣어 detector/model.py 규격(RGB 0~1 입력, 로짓 1개)에 맞춘다.

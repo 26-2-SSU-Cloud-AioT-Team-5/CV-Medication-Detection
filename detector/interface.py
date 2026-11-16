@@ -1,26 +1,21 @@
-# RPi SW가 호출하는 유일한 진입점: detect(compartment_id).
-
-# config.yaml의 detector.backend 값으로 구현을 고른다.
-# - dummy    : 항상 has_pill=True, confidence=1.0 (연동용)
-# - baseline : 기준 이미지 비교 (baseline.py, 아직 stub)
-# - model    : 학습 모델 (model.py, ONNX Runtime)
-
-import time
+# RPi SW가 호출하는 유일한 진입점: count_pills(image).
+# 촬영과 서버 전송은 RPi SW 담당. 이미지는 디스크에 저장하지 않는다.
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import yaml
 
+from . import model
+
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
-BACKENDS = ("dummy", "baseline", "model")
 
 
 @dataclass
-class DetectResult:
-    compartment_id: int
-    has_pill: bool        # 알약 유무
+class CountResult:
+    compartment_id: int   # 1~4
+    count: int
     confidence: float     # 0~1
-    captured_at: float    # time.time() 기기 시각
 
 
 def _load_config() -> dict:
@@ -28,35 +23,18 @@ def _load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def detect(compartment_id: int) -> DetectResult:
-    #촬영 -> 전처리 -> 판별
-    cfg = _load_config()
-    backend = cfg["detector"]["backend"]
-    if backend not in BACKENDS:
-        raise ValueError(f"unknown detector.backend: {backend!r} (choose from {BACKENDS})")
+def count_pills(image: np.ndarray) -> dict[int, CountResult]:
+    # image: 통 전체 BGR 이미지 (H, W, 3, uint8)
+    if not isinstance(image, np.ndarray) or image.dtype != np.uint8 or image.ndim != 3 \
+            or image.shape[2] != 3 or 0 in image.shape:
+        desc = None if image is None else (getattr(image, "shape", type(image)), getattr(image, "dtype", None))
+        raise ValueError(f"image는 (H, W, 3) uint8 BGR ndarray여야 함: {desc}")
 
-    captured_at = time.time()
-    if backend == "dummy":
-        return DetectResult(compartment_id, True, 1.0, captured_at)
+    cfg = _load_config()["model"]
+    if not cfg.get("path"):
+        raise RuntimeError("config.yaml의 model.path가 비어 있음. 학습 파트가 준 .onnx 경로를 적을 것")
 
-    # 아래 모듈은 아직 stub -> NotImplementedError가 나는 게 정상
-    from . import camera, preprocess
-
-    image = camera.capture(compartment_id, cfg["camera"])
-    image = preprocess.crop_roi(image, cfg["compartments"][compartment_id]["roi"])
-    image = preprocess.resize(image, tuple(cfg["preprocess"]["size"]))
-
-    if backend == "baseline":
-        from . import baseline
-        image = preprocess.normalize_brightness(image)  # 모델은 정규화를 자체적으로 하므로 baseline에만 적용
-        has_pill, confidence = baseline.compare(
-            compartment_id, image, cfg["baseline"]["threshold"]
-        )
-    else:
-        from . import model
-        has_pill, confidence = model.predict(
-            model.load_model(cfg["model"]["path"]), image, cfg["model"]["threshold"]
-        )
-
-    del image  
-    return DetectResult(compartment_id, bool(has_pill), float(confidence), captured_at)
+    preds = model.predict(
+        model.load_model(cfg["path"]), image, tuple(cfg["input_size"]), cfg["num_compartments"]
+    )
+    return {cid: CountResult(cid, count, conf) for cid, (count, conf) in preds.items()}

@@ -1,26 +1,38 @@
-#학습 모델 판별 (ResNet18 이진 분류, ONNX Runtime, RPi 기기 내 추론). 모델 규격은 README 참고.
+# 학습 모델 실행 (ONNX Runtime, RPi 기기 내 추론). 모델 규격은 README 참고.
 from functools import lru_cache
 from pathlib import Path
 
+import cv2
 import numpy as np
 import onnxruntime as ort
 
 ROOT = Path(__file__).parent.parent
 
 
-@lru_cache(maxsize=1)  # detect()마다 호출되므로 프로세스당 한 번만 읽는다
+@lru_cache(maxsize=1)  # 호출마다 다시 읽지 않도록 프로세스당 한 번만 로드
 def load_model(path: str) -> ort.InferenceSession:
-    #path의 모델을 로드해 반환한다. 상대 경로는 저장소 루트 기준 (실행 위치와 무관).
+    # 상대 경로는 저장소 루트 기준 (실행 위치와 무관)
     return ort.InferenceSession(str(ROOT / path), providers=["CPUExecutionProvider"])
 
 
-def predict(model: ort.InferenceSession, image: np.ndarray, threshold: float = 0.5) -> tuple[bool, float]:
-    #ROI 자르기/리사이즈를 거친 BGR 이미지(H, W, 3, uint8)로 (has_pill, confidence 0~1)를 반환한다.
-    #mean/std 정규화는 모델 안에서 하므로 여기서는 RGB 0~1로만 바꿔 넘긴다.
-    x = image[..., ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0  # BGR HWC -> RGB NCHW
-    logits = model.run(None, {model.get_inputs()[0].name: x})[0].reshape(-1)
-    # 출력이 1개면 "있음" 로짓(sigmoid), 2개면 [없음, 있음] 로짓(softmax). 둘 다 같은 식으로 귀결된다.
-    z = logits[0] if logits.size == 1 else logits[1] - logits[0]
-    p_filled = float(0.5 * (1.0 + np.tanh(z / 2.0)))  # sigmoid, 큰 로짓에서도 overflow 없음
-    has_pill = p_filled >= threshold
-    return has_pill, p_filled if has_pill else 1.0 - p_filled
+def predict(
+    session: ort.InferenceSession,
+    image: np.ndarray,
+    input_size: tuple[int, int] = (224, 224),
+    num_compartments: int = 4,
+) -> dict[int, tuple[int, float]]:
+    # 통 전체 BGR 이미지 -> {칸 번호: (개수, confidence 0~1)}
+    # TODO(학습 파트 확정): 입력 변환. 리사이즈 -> BGR→RGB -> /255 -> float32 NCHW, mean/std는 모델 안에 있다고 가정
+    x = cv2.resize(image, tuple(input_size), interpolation=cv2.INTER_AREA)
+    x = x[..., ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+
+    logits = session.run(None, {session.get_inputs()[0].name: x})[0]
+    # TODO(학습 파트 확정): 출력 해석. (1, 칸 수, K) 칸별 클래스 로짓, 클래스 인덱스 = 개수, 순서 i = 칸 i+1
+    if logits.ndim != 3 or logits.shape[:2] != (1, num_compartments):
+        raise ValueError(f"모델 출력 shape이 (1, {num_compartments}, K)가 아님: {logits.shape}")
+
+    z = logits[0].astype(np.float64)
+    p = np.exp(z - z.max(axis=1, keepdims=True))  # 최댓값을 빼서 overflow 방지
+    p /= p.sum(axis=1, keepdims=True)
+    counts = p.argmax(axis=1)
+    return {i + 1: (int(counts[i]), float(p[i, counts[i]])) for i in range(num_compartments)}
