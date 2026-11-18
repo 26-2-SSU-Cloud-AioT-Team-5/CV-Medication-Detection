@@ -3,3 +3,6 @@ __pycache__/
 
 /training/dataset_synth_prep/*
 !/training/dataset_synth_prep/.gitkeep
+
+/training/dataset/*
+!/training/dataset/.gitkeep
