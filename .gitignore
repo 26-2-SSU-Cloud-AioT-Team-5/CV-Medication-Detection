@@ -1,2 +1,5 @@
 __pycache__/
 .pytest_cache/
+
+/training/dataset_synth_prep/*
+!/training/dataset_synth_prep/.gitkeep
