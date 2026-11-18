@@ -6,3 +6,6 @@ __pycache__/
 
 /training/dataset/*
 !/training/dataset/.gitkeep
+
+/training/results/*
+!/training/results/.gitkeep
