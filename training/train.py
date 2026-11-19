@@ -28,12 +28,14 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
+# ==============================================================================================
+
 # ============================================================
 # Path Configuration (relative overrides resolve from PROJECT_ROOT)
 # ============================================================
 TRAINING_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TRAINING_DIR.parent
-DATASET_DIR = TRAINING_DIR / "dataset"
+DATASET_DIR = TRAINING_DIR / "dataset" / "train_n_val"
 CHECKPOINT_DIR = TRAINING_DIR / "checkpoints"
 RESULTS_DIR = TRAINING_DIR / "results"
 
@@ -75,6 +77,8 @@ EARLY_STOPPING_PATIENCE = 7
 DEVICE = "auto"  # CUDA -> MPS -> CPU, or explicitly "cuda", "mps", "cpu"
 ENABLE_AMP = True  # CUDA only; CPU and MPS always use FP32
 DETERMINISTIC_TRAINING = True
+
+# ==============================================================================================
 
 # Both direct execution and `python -m training.train` work from any directory.
 if str(PROJECT_ROOT) not in sys.path:
