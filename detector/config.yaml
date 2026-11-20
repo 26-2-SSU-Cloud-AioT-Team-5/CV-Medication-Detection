@@ -1,4 +1,11 @@
 model:
-  path: null              # 학습 파트가 준 .onnx 경로 (저장소 루트 기준)
-  input_size: [224, 224]  # (width, height) — 학습 파트 확정 후 수정
-  num_compartments: 4
+  path: null              # export_onnx.py로 만든 .onnx 경로 (저장소 루트 기준)
+  input_size: [224, 224]  # (width, height). 학습 입력 크기
+
+# 칸별 크롭 영역 [x, y, w, h] (통 전체 사진의 픽셀 좌표, 학습 때 잘라낸 영역과 같아야 함)
+# TODO(학습 파트): resize_test.py로 잘라낸 좌표가 저장되지 않았음. 같은 카메라 위치·해상도에서 다시 잴 것
+rois:
+  1: null
+  2: null
+  3: null
+  4: null

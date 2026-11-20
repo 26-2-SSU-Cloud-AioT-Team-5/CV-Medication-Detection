@@ -2,9 +2,9 @@
 from functools import lru_cache
 from pathlib import Path
 
-import cv2
 import numpy as np
 import onnxruntime as ort
+from PIL import Image
 
 ROOT = Path(__file__).parent.parent
 
@@ -15,24 +15,23 @@ def load_model(path: str) -> ort.InferenceSession:
     return ort.InferenceSession(str(ROOT / path), providers=["CPUExecutionProvider"])
 
 
-def predict(
-    session: ort.InferenceSession,
-    image: np.ndarray,
-    input_size: tuple[int, int] = (224, 224),
-    num_compartments: int = 4,
-) -> dict[int, tuple[int, float]]:
-    # 통 전체 BGR 이미지 -> {칸 번호: (개수, confidence 0~1)}
-    # TODO(학습 파트 확정): 입력 변환. 리사이즈 -> BGR→RGB -> /255 -> float32 NCHW, mean/std는 모델 안에 있다고 가정
-    x = cv2.resize(image, tuple(input_size), interpolation=cv2.INTER_AREA)
-    x = x[..., ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+def preprocess(crop: np.ndarray, input_size: tuple[int, int]) -> np.ndarray:
+    # 칸 크롭 BGR -> 1x3xHxW float32 RGB 0~1. mean/std는 모델 안에 있음
+    # 학습 데이터(resize_test.py)와 같은 PIL LANCZOS 리사이즈 (cv2 LANCZOS4는 축소 시 결과가 다름)
+    rgb = Image.fromarray(np.ascontiguousarray(crop[..., ::-1]))
+    x = np.asarray(rgb.resize(tuple(input_size), Image.Resampling.LANCZOS), np.float32) / 255.0
+    return x.transpose(2, 0, 1)[None]
 
-    logits = session.run(None, {session.get_inputs()[0].name: x})[0]
-    # TODO(학습 파트 확정): 출력 해석. (1, 칸 수, K) 칸별 클래스 로짓, 클래스 인덱스 = 개수, 순서 i = 칸 i+1
-    if logits.ndim != 3 or logits.shape[:2] != (1, num_compartments):
-        raise ValueError(f"모델 출력 shape이 (1, {num_compartments}, K)가 아님: {logits.shape}")
+
+def predict(session: ort.InferenceSession, crop: np.ndarray,
+            input_size: tuple[int, int] = (224, 224)) -> tuple[int, float]:
+    # 칸 하나의 BGR 크롭 -> (개수, confidence 0~1). 출력 (1, K) 로짓, 인덱스 = 개수
+    logits = session.run(None, {session.get_inputs()[0].name: preprocess(crop, input_size)})[0]
+    if logits.ndim != 2 or logits.shape[0] != 1:
+        raise ValueError(f"모델 출력 shape이 (1, K)가 아님: {logits.shape}")
 
     z = logits[0].astype(np.float64)
-    p = np.exp(z - z.max(axis=1, keepdims=True))  # 최댓값을 빼서 overflow 방지
-    p /= p.sum(axis=1, keepdims=True)
-    counts = p.argmax(axis=1)
-    return {i + 1: (int(counts[i]), float(p[i, counts[i]])) for i in range(num_compartments)}
+    p = np.exp(z - z.max())  # 최댓값을 빼서 overflow 방지
+    p /= p.sum()
+    count = int(p.argmax())
+    return count, float(p[count])
