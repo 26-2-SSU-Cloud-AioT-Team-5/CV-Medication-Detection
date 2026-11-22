@@ -32,7 +32,7 @@ class _Compartment:
 def is_open(crop: np.ndarray, dark_level: int, open_dark_ratio: float) -> bool:
     # 열린 칸은 검은 바닥판, 닫힌 칸은 흰 뚜껑이 보인다
     # ponytail: 밝기 비율만 봄. 바닥판 색이 바뀌거나 조명이 어두워 틀리면 닫힌 뚜껑 기준 사진과의 차이로 바꿀 것
-    return (crop.mean(axis=2) < dark_level).mean() >= open_dark_ratio
+    return bool((crop.mean(axis=2) < dark_level).mean() >= open_dark_ratio)
 
 
 def stable_result(history: list, frames: int, min_conf: float) -> Optional[tuple]:
