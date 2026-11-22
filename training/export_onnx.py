@@ -6,6 +6,7 @@ ImageNet 정규화를 모델 안에 넣어 detector/model.py 규격(RGB 0~1 입�
 
 사용 (학습 환경, torch/torchvision/onnxruntime 필요):
     python -m training.export_onnx training/checkpoints/<파일>.pt
+    python -m training.export_onnx --random bench.onnx   # 가중치 없이 RPi 속도 측정용
 결과는 체크포인트 옆 .onnx. 그 경로를 detector/config.yaml의 model.path에 적는다.
 """
 
@@ -40,12 +41,12 @@ class Normalized(nn.Module):
         return self.model((x - self.mean) / self.std)
 
 
-def export(checkpoint_path: Path, onnx_path: Path) -> None:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    # best.pt는 state_dict 그대로, last.pt는 {"model_state_dict": ...}
-    state = checkpoint.get("model_state_dict", checkpoint)
+def export(checkpoint_path, onnx_path: Path) -> None:
     model = build_model(pretrained=False)
-    model.load_state_dict(state, strict=True)
+    if checkpoint_path is not None:  # None = 랜덤 가중치 (RPi 속도 측정용, 개수는 의미 없음)
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        # best.pt는 state_dict 그대로, last.pt는 {"model_state_dict": ...}
+        model.load_state_dict(checkpoint.get("model_state_dict", checkpoint), strict=True)
     model.eval()
     wrapped = Normalized(model).eval()
 
@@ -65,7 +66,11 @@ def export(checkpoint_path: Path, onnx_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("usage: python -m training.export_onnx <checkpoint.pt>")
-    ckpt = Path(sys.argv[1])
-    export(ckpt, ckpt.with_suffix(".onnx"))
+    if len(sys.argv) == 3 and sys.argv[1] == "--random":
+        export(None, Path(sys.argv[2]))
+    elif len(sys.argv) == 2:
+        ckpt = Path(sys.argv[1])
+        export(ckpt, ckpt.with_suffix(".onnx"))
+    else:
+        sys.exit("usage: python -m training.export_onnx <checkpoint.pt>\n"
+                 "       python -m training.export_onnx --random <out.onnx>   # 속도 측정용 랜덤 가중치")

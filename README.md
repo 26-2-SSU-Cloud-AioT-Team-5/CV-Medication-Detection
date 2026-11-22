@@ -40,6 +40,31 @@ while True:
 - `config.yaml`의 `model.path` 또는 해당 칸의 `rois`가 비어 있으면 `RuntimeError`
 - 이미지는 디스크에 저장하지 않는다. image는 ROI를 잡은 사진과 같은 카메라 위치·해상도여야 한다.
 
+## RPi 설치 / 속도 측정
+
+Raspberry Pi OS **64-bit** 기준 (32-bit에는 `onnxruntime`이 없음).
+
+```bash
+sudo apt install -y python3-picamera2            # 카메라 (apt로만 설치됨)
+python3 -m venv --system-site-packages .venv     # apt로 깐 picamera2를 venv에서 쓰기 위해
+. .venv/bin/activate
+pip install onnxruntime numpy Pillow PyYAML
+```
+
+모델이 아직 없으면 PC에서 랜덤 가중치 ONNX를 만들어 복사한다 (속도만 같고 개수는 의미 없음).
+
+```bash
+python -m training.export_onnx --random bench.onnx   # PC (torch 필요)
+scp bench.onnx pi@<약통 Pi>:~/CV-Medication-Detection/
+```
+
+```bash
+python -m detector.bench bench.onnx --camera     # RPi: 촬영 + 크롭 + 추론 시간, CPU 온도
+```
+
+`최악 1회(촬영 + 4칸 열림 update)`가 1000 ms 안이면 1초 간격 호출이 가능하다.
+PC(데스크톱 CPU, 촬영 제외)에서는 약 210 ms였다.
+
 ## 칸 ROI 보정
 
 카메라나 통이 움직이면 통 전체를 다시 찍고 ROI를 새로 잡는다. (PC에서는 `pip install opencv-python` 필요)
