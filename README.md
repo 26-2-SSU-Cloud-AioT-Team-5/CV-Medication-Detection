@@ -187,7 +187,7 @@ python training/train_phase2.py \
 
 다른 Phase 1 모델을 사용하려면 `--phase1-checkpoint <체크포인트 경로>`를 추가한다. 현재 Phase 2 스크립트는 기존 Phase 2 head를 이어서 학습하는 방식이 아니다.
 
-### 학습 동작 확인 및 추론
+### 학습 동작 확인
 
 1epoch 동작 확인은 임시 출력 폴더를 사용한다. Phase 2 확인에는 실제 Phase 1 체크포인트가 필요하다.
 
@@ -196,19 +196,7 @@ python training/train_phase1.py --smoke-test
 python training/train_phase2.py --smoke-test
 ```
 
-학습된 모델의 이미지별 예측과 정확도는 다음 명령으로 확인한다.
-
-```bash
-python -m training.test_inference
-```
-
-`training/test_inference.py`의 `CHECKPOINT_NAME = None`이면 `phase2/best.pt`, `phase1/best.pt`, 구형 체크포인트 순으로 탐색한다. 새 실행 결과를 평가하려면 다음처럼 이름을 지정한다.
-
-```python
-CHECKPOINT_NAME = "phase2_run2/best.pt"
-```
-
-GUI가 없는 환경에서는 같은 파일의 `SHOW_GUI = False`로 설정한다. 추론에서도 224×224 PNG 규격과 학습 시 정규화를 그대로 사용한다.
+학습된 체크포인트의 정확도와 이미지별 예측을 확인하려면 [test_inference.py 사용법](#test_inferencepy-사용법)을 참고한다.
 
 ## 학습 결과와 지표
 
@@ -273,3 +261,43 @@ Balanced accuracy는 세 상태의 재현율을 평균한 값이다. False accep
 현재 `phase2/best.pt`를 `test_inference.py`로 다시 평가한 결과, **상태와 개수를 함께 반영한 최종 정확도는 96.30% (104/108)**다. 상태 분류는 108장을 모두 맞혔으며, 개수 분류 오류 4건이 남아 있다. Phase 2의 상태 정확도 100%와 최종 개수 판정 정확도는 구분해서 해석해야 한다.
 
 현재 `test` 폴더는 두 Phase의 체크포인트 선택에도 사용한다. 따라서 위 값은 독립 테스트 성능이 아닌 검증 성능이다. class7 실촬영 표본은 없으며, 실제 운영 성능을 확인하려면 학습·검증과 촬영 세션을 분리한 데이터를 추가로 평가해야 한다. 픽셀 해시 검사는 완전히 동일한 이미지의 중복을 검사하며, 같은 촬영의 유사 프레임까지 분리해 주지는 않는다.
+
+## `test_inference.py` 사용법
+
+### 실행과 입력 준비
+
+PyTorch, torchvision, NumPy, Pillow가 설치된 Python 환경에서 프로젝트 루트로 이동해 실행한다.
+
+```bash
+python3 -m training.test_inference
+```
+
+기본 평가 폴더는 `training/dataset/test/`다. **224×224 PNG** 이미지를 실제 알약 개수에 해당하는 `class0/`~`class7/`에 넣는다. Phase 2 모델로 평가할 때는 손 가림 이미지를 `class_hand_occulusion/`에, 뚜껑 닫힘 이미지를 `class_lid_closed/`에 넣는다. 폴더명이 정답 레이블이 된다.
+
+### 체크포인트와 실행 옵션
+
+옵션은 [training/test_inference.py](training/test_inference.py) 상단에서 설정한다. `CHECKPOINT_DIR`과 `TEST_DIR`의 상대 경로는 프로젝트 루트 기준이며, `CHECKPOINT_NAME`의 상대 경로는 `CHECKPOINT_DIR` 기준이다.
+
+| 설정 | 기본값 | 동작 |
+|---|---|---|
+| `CHECKPOINT_DIR` | `training/checkpoints/` | 체크포인트를 찾을 폴더 |
+| `CHECKPOINT_NAME` | `None` | `phase2/best.pt` → `phase1/best.pt` → `261119_class07_best.pt` 순으로 탐색 |
+| `TEST_DIR` | `training/dataset/test/` | 평가 이미지 폴더 |
+| `BATCH_SIZE` | `32` | 한 번에 추론할 이미지 수 |
+| `DEVICE` | `"auto"` | CUDA → MPS → CPU 순으로 선택. `"cuda"`, `"mps"`, `"cpu"`로 직접 지정 가능 |
+| `SHOW_GUI` | `True` | 평가 후 이미지별 예측 창을 연다. 터미널에서만 확인하려면 `False`로 설정 |
+| `GUI_PYTHON` | `None` | GUI가 실행될 별도 Python의 실행 파일 경로를 지정할 수 있음 |
+
+예를 들어 `phase2_run2`의 모델을 별도 데이터로 평가하고 터미널에서 결과를 확인하려면 다음과 같이 설정한다.
+
+```python
+CHECKPOINT_NAME = "phase2_run2/best.pt"
+TEST_DIR = "training/dataset/test_run2"
+SHOW_GUI = False
+```
+
+### 결과 확인
+
+- 터미널에는 클래스별 평가 수, 건너뛴 이미지 수, 정답·오답 수, 정확도와 전체 정확도가 출력된다. 열 수 없거나 입력 규격과 다른 이미지는 `[SKIP]` 사유와 함께 표시되며 정확도 집계에서 제외된다.
+- Phase 1은 개수 정확도를 집계한다. Phase 2는 계수 가능 이미지에서 상태와 개수가 모두 맞을 때, 손 가림·뚜껑 닫힘 이미지에서는 해당 상태가 맞을 때 정답으로 집계한다. False accept와 false reject 건수도 함께 출력한다.
+- GUI를 열려면 Tk 8.6 이상과 Pillow의 `ImageTk`를 사용할 수 있어야 한다. 창에서 `이전`·`다음` 버튼 또는 `←`·`→` 키로 이미지를 넘기며 실제 레이블, 예측, 정오답, softmax 점수를 확인한다. Phase 2에서 손 가림이나 뚜껑 닫힘으로 예측하면 `개수 예측 보류`가 표시된다.
