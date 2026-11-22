@@ -29,6 +29,7 @@ result = count_pills(image, 2)  # image: 통 전체 BGR (H, W, 3, uint8), 2: 뚜
 ## 칸 ROI 보정
 
 카메라나 통이 움직이면 통 전체를 다시 찍고 ROI를 새로 잡는다. (PC에서는 `pip install opencv-python` 필요)
+기준: 칸마다 **검은 바닥판을 딱 덮는 박스** (흰 벽은 거의 넣지 않음). 칸 번호는 사진 왼쪽부터 1~4.
 
 ```bash
 python -m detector.calibrate 사진.jpg          # 칸 1→4 순서로 드래그 → Enter, 끝나면 Esc → config.yaml rois 저장
