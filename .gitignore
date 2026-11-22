@@ -1,5 +1,10 @@
 __pycache__/
 .pytest_cache/
+.DS_Store
+*_rois.jpg
+*.onnx
+*.pt
+*.zip
 
 /training/dataset_synth_prep/*
 !/training/dataset_synth_prep/.gitkeep
