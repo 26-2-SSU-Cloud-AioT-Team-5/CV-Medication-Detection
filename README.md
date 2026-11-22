@@ -1,115 +1,275 @@
 # CV-Medication-Detection
 
-스마트 알약통 CV 모듈. 칸에 알약이 **있는지/없는지**만 판별한다.
+## 설명
 
-## ResNet-18 이진 분류 학습
+스마트 알약통의 칸 이미지를 입력받아 **알약 개수와 계수 가능한 상태인지**를 판별하는 컴퓨터 비전 프로젝트다.
 
-Python 3.9 이상에서 프로젝트 루트 기준으로 의존성을 설치한다.
+- **개수 분류:** `class0`~`class7`, 즉 알약 0~7개를 분류한다.
+- **상태 분류:** `계수 가능`, `손 가림`, `뚜껑 닫힘`을 분류한다.
+- **최종 판정:** 상태가 `계수 가능`일 때만 개수를 반환한다. 손에 가려졌거나 뚜껑이 닫힌 경우 개수는 `None`으로 처리한다.
 
-```bash
-python3 -m pip install -r requirements.txt
-```
+Phase 1에서 개수 분류 모델을 학습하고, Phase 2에서 기존 개수 분류 기능을 유지하면서 상태 분류 head를 추가한다. 현재 저장된 Phase 1 및 Phase 2 학습은 모두 완료된 상태다.
 
-데이터셋은 아래처럼 준비한다. `filled=1`은 알약 있음, `not_filled=0`은 알약 없음을 의미한다.
-train/val 분리는 사용자가 준비하며, 동일한 이미지나 같은 촬영에서 나온 유사 프레임이
-두 split에 섞이지 않도록 한다. 각 클래스에는 적어도 한 장의 이미지가 필요하다.
+## 워크스페이스 트리
 
 ```text
-training/dataset/
-├── train/
-│   ├── filled/       # 알약이 보이는 이미지
-│   └── not_filled/   # 알약이 없는 이미지
-└── val/
-    ├── filled/
-    └── not_filled/
+CV-Medication-Detection/
+├── README.md
+├── architecture/
+│   └── model.py                         # ResNet-18 개수 모델 및 두 head를 가진 모델
+└── training/
+    ├── dataset_sampler.py               # 이미지 로딩, 정규화, 샘플 선택 및 중복 검사
+    ├── train_phase1.py                  # 개수 분류 모델 학습
+    ├── train_phase2.py                  # 상태 분류 head 학습
+    ├── test_inference.py                # 체크포인트 평가 및 이미지별 예측 GUI
+    ├── dataset/
+    │   ├── train_n_val/
+    │   │   ├── class0/ ~ class7/         # 개수별 합성 이미지
+    │   │   ├── class_hand_occulusion/   # 손에 가려진 이미지
+    │   │   └── class_lid_closed/        # 뚜껑이 닫힌 이미지
+    │   └── test/
+    │       ├── class0/ ~ class7/         # 개수별 실촬영 이미지; 현재 class7은 비어 있음
+    │       ├── class_hand_occulusion/
+    │       └── class_lid_closed/
+    ├── dataset_synth_prep/              # 합성용 원본 배경·알약 자산 준비 위치
+    ├── checkpoints/
+    │   ├── phase1/
+    │   └── phase2/
+    ├── results/
+    │   ├── phase1/
+    │   └── phase2/
+    └── utilities/
+        ├── capture_rpi_image.py         # SSH를 통한 Raspberry Pi 카메라 촬영
+        ├── resize_test.py               # ROI 선택 및 224×224 이미지 저장 GUI
+        └── generate_synthetic_dataset.py # 알약 합성 데이터 생성 및 검증
 ```
 
-JPG/JPEG, PNG, BMP, WEBP, TIFF 이미지를 지원하며 클래스 폴더 내부의 하위 폴더도 탐색한다.
-각 클래스의 `.gitignore`는 이미지가 Git에 올라가지 않도록 한다.
+위 트리의 데이터와 학습 산출물은 현재 로컬 워크스페이스 기준이다. 이미지, 체크포인트, 결과 파일은 Git에서 제외되므로 저장소를 clone한 뒤에는 별도로 준비하거나 생성해야 한다. `dataset_synth_prep/`에는 현재 원본 합성 자산이 포함되어 있지 않다.
 
-**설정은 `training/train.py` 상단 전역 변수 섹션에서 변경한다. CLI 인자는 사용하지 않는다.**
+## Model architecture
 
-| 변수 | 기본값 | 역할 |
+[architecture/model.py](architecture/model.py)에 ResNet-18 기반 모델을 정의한다.
+
+```mermaid
+flowchart TD
+    A["RGB 이미지 224×224"] --> B["텐서 변환 및 ImageNet 정규화"]
+    B --> C["ResNet-18 backbone"]
+    C --> D["전역 평균 풀링 · 512차원 특징"]
+    D --> E["Count head · Linear 512→8"]
+    D --> F["Status head · Linear 512→3"]
+    E --> G["알약 개수 후보 0~7"]
+    F --> H["계수 가능 / 손 가림 / 뚜껑 닫힘"]
+    G --> I["상태가 계수 가능일 때만 개수 반환"]
+    H --> I
+```
+
+| 구성 | Phase 1 | Phase 2 |
 |---|---|---|
-| `DATASET_ROOT` | `training/dataset` | train/val 폴더가 있는 경로 |
-| `OUTPUT_DIR` | `training/outputs` | 실행별 결과 폴더를 생성할 위치 |
-| `EPOCHS` | `20` | 전체 학습 epoch 수 |
-| `BATCH_SIZE` | `32` | 배치당 이미지 수 |
-| `LEARNING_RATE` | `1e-4` | Adam 학습률 |
-| `WEIGHT_DECAY` | `1e-4` | 가중치 감쇠 |
-| `IMAGE_SIZE` | `224` | 입력 이미지 한 변의 크기 |
-| `NUM_WORKERS` | `0` | 데이터 로딩 프로세스 수 |
-| `VAL_EVERY_STEPS` | `0` | 0이면 매 epoch 종료 시 검증, 양수면 N step마다 추가 검증 |
-| `LOG_EVERY_STEPS` | `10` | 학습 진행 로그 출력 주기 |
-| `PRETRAINED` | `True` | ImageNet 가중치로 초기화 |
-| `THRESHOLD` | `0.5` | 알약 있음 판정 확률 임계값 |
-| `DEVICE` | `"auto"` | CUDA → MPS → CPU 자동 선택 또는 직접 지정 |
-| `SEED` | `42` | 난수 시드 |
+| 모델 | `build_model()` | `PillStateClassifier` |
+| 초기 가중치 | ImageNet 사전 학습 ResNet-18 | Phase 1의 `best.pt` |
+| Backbone | 전체 학습 | 가중치와 BatchNorm 통계 고정 |
+| Count head | `Linear(512, 8)` 학습 | Phase 1 가중치 유지 및 고정 |
+| Status head | 사용하지 않음 | `Linear(512, 3)`만 학습 |
+| 출력 | 개수 logits `[B, 8]` | 개수 logits `[B, 8]`, 상태 logits `[B, 3]` |
 
-경로에는 `Path` 또는 문자열을 사용할 수 있다. 상대 경로는 프로젝트 루트 기준으로 해석한다.
-`PRETRAINED=True`인 최초 실행에는 가중치 다운로드를 위한 인터넷 연결이 필요할 수 있다.
+두 head는 같은 512차원 특징을 공유한다. Phase 2에서 학습하는 파라미터는 상태 head의 **1,539개**다. Backbone이 고정되어 있으므로 이미지 특징을 한 번 추출해 캐시한 뒤 head를 학습한다.
+
+모델은 softmax를 적용하지 않은 logits를 반환한다. 추론 코드에서 softmax와 `argmax`를 적용하며 상태 인덱스는 다음과 같다.
+
+| 인덱스 | 상태 이름 | 의미 |
+|---|---|---|
+| 0 | `countable` | 계수 가능. 빈 통도 포함한다. |
+| 1 | `hand_occlusion` | 손에 가려져 계수할 수 없음 |
+| 2 | `lid_closed` | 뚜껑이 닫혀 계수할 수 없음 |
+
+## 데이터셋 설명
+
+### 이미지 규격 및 전처리
+
+- 입력은 **224×224 PNG**이며 로딩 시 RGB로 변환한다.
+- 텐서는 `[3, 224, 224]`, `float32`이고 픽셀값을 `255`로 나눈다.
+- ImageNet 평균 `(0.485, 0.456, 0.406)`과 표준편차 `(0.229, 0.224, 0.225)`로 정규화한다.
+- 학습·검증·추론 로더에서는 리사이즈, 크롭, 무작위 증강을 수행하지 않는다. 입력 이미지를 미리 규격에 맞춰 준비해야 한다.
+- 합성 데이터 생성기는 별도로 알약 배치·회전, 장면 회전·반전, 밝기·대비·조명·그림자 변화를 적용한다.
+
+### 현재 데이터 구성
+
+`classN`은 알약 N개를 의미한다. 개수별 학습 이미지에는 알약 유형 A~D를 사용하며, class1~7은 각 유형당 500장씩 구성된다.
+
+| 폴더 | 의미 | `train_n_val` | `test` |
+|---|---|---:|---:|
+| `class0` | 빈 통, 알약 0개 | 2,000 | 12 |
+| `class1` | 알약 1개 | 2,000 | 12 |
+| `class2` | 알약 2개 | 2,000 | 12 |
+| `class3` | 알약 3개 | 2,000 | 12 |
+| `class4` | 알약 4개 | 2,000 | 12 |
+| `class5` | 알약 5개 | 2,000 | 12 |
+| `class6` | 알약 6개 | 2,000 | 12 |
+| `class7` | 알약 7개 | 2,000 | 0 |
+| `class_hand_occulusion` | 손 가림 | 32 | 12 |
+| `class_lid_closed` | 뚜껑 닫힘 | 32 | 12 |
+| **합계** | | **16,064** | **108** |
+
+손 가림 폴더의 `occulusion`은 현재 코드와 데이터에 사용 중인 철자다. 모델의 상태 이름은 `hand_occlusion`을 사용한다.
+
+현재 학습 스크립트는 `train_n_val` 내부를 다시 분할하지 않는다. **`train_n_val`을 학습에, `test`를 학습 중 검증과 체크포인트 선택에 사용한다.**
+
+Phase 1은 개수별 합성 이미지 16,000장으로 학습하고, class0~6의 실촬영 이미지 84장으로 검증한다. Phase 2는 아래 표본만 선택해 상태 레이블로 학습하며, 검증에는 현재 `test`의 108장을 모두 사용한다.
+
+| Phase 2 상태 | 학습 표본 구성 | 학습 수 | 검증 수 |
+|---|---|---:|---:|
+| 계수 가능 | class0 256장 + class1~7 각각 4장 | 284 | 84 |
+| 손 가림 | 해당 폴더 전체 | 32 | 12 |
+| 뚜껑 닫힘 | 해당 폴더 전체 | 32 | 12 |
+| **합계** | | **348** | **108** |
+
+Phase 2 학습에는 상태별 표본 수의 역수를 가중치로 사용하는 `WeightedRandomSampler`를 적용한다. 한 epoch에 348번 복원 추출하며, 세 상태가 선택될 확률은 각각 1/3이다. 개별 epoch에서는 같은 이미지가 반복되거나 일부 이미지가 선택되지 않을 수 있다.
+
+두 학습 스크립트는 선택한 학습·검증 이미지의 RGB 픽셀 해시를 비교해 완전히 동일한 이미지의 중복을 차단하고, 데이터 지문과 선택 내역을 체크포인트 폴더에 저장한다.
+
+## Phase 1 / 2 학습
+
+### 실행 환경과 공통 설정
+
+프로젝트 루트에서 PyTorch, torchvision, NumPy, Pillow, tqdm, Matplotlib이 설치된 Python 환경으로 실행한다. 합성 데이터 생성에는 OpenCV가 추가로 필요하며, 이미지 GUI에는 Tk 8.6 이상과 Pillow의 ImageTk가 필요하다. 현재 저장된 Phase 1 실행 기록의 PyTorch 버전은 `2.7.0+cu128`이다.
+
+학습 설정은 각 스크립트 상단의 전역 변수로 관리한다. 상대 경로는 프로젝트 루트 기준으로 해석하며, `DEVICE = "auto"`는 CUDA → MPS → CPU 순서로 장치를 선택한다. 학습 시드는 42이고, Phase 2의 표본 선택 시드도 42다.
+
+| 설정 | Phase 1 | Phase 2 |
+|---|---|---|
+| 최대 epoch | 30 | 100 |
+| 배치 크기 | 학습·검증 각각 64 | 16 |
+| Optimizer | AdamW | AdamW |
+| 초기 학습률 | `3e-4` | `1e-3` |
+| Weight decay | `1e-4` | `1e-4` |
+| 학습률 스케줄러 | CosineAnnealingLR, 최저 `1e-6` | 사용하지 않음 |
+| 손실 함수 | CrossEntropyLoss | CrossEntropyLoss |
+| 혼합 정밀도 | CUDA에서 AMP 사용 | FP32 |
+| 조기 종료 기준 | 검증 정확도 7epoch 연속 미개선 | 검증 loss 20epoch 연속 미개선, 최소 개선량 `1e-4` |
+
+### Phase 1: 개수 분류 학습
+
+ImageNet 사전 학습 모델의 마지막 FC를 8개 클래스 출력으로 교체하고, backbone과 개수 head 전체를 학습한다.
 
 ```bash
-python3 training/train.py
-# 또는
-python3 -m training.train
+python training/train_phase1.py
 ```
 
-`architecture/model.py`의 `PillClassifier`는 ResNet-18의 FC 출력을 1개로 변경하고
-이미지당 하나의 logit을 반환한다. `BCEWithLogitsLoss`와 Adam으로 모든 레이어를 학습한다.
-`sigmoid(logit) >= THRESHOLD`이면 알약 검출(`filled`)이다.
+- 체크포인트: `training/checkpoints/phase1/`
+- 학습 결과: `training/results/phase1/`
+- `best.pt`: 검증 정확도가 가장 높은 모델의 state dict. 정확도가 같으면 기존 best를 유지한다.
+- `last.pt`: 마지막 epoch의 모델·optimizer·scheduler 상태 등을 저장한다. 현재 스크립트에는 이 파일에서 자동으로 학습을 재개하는 CLI가 없다.
+- `validation_split.json`: 사용한 데이터와 검증 이미지 목록, 전처리 및 데이터 지문을 저장한다.
 
-`training/dataset_sampler.py`는 RGB 변환, 전체 이미지 리사이즈, ImageNet 정규화를 수행한다.
-학습에만 약한 밝기·대비 증강과 셔플을 적용하며, 검증은 증강 없이 모든 이미지를 평가한다.
-검증 accuracy는 전체 정답 수 / 전체 이미지 수이고, loss도 이미지 수로 가중 평균한다.
-중간 검증 후에는 학습 모드로 복귀한다.
+출력 폴더에 기존 실행 파일이 있으면 실행을 중단한다. 재학습 시에는 스크립트의 `CHECKPOINT_DIR`와 `RESULTS_DIR`를 모두 새로운 경로로 설정한다.
 
-결과는 `training/outputs/<실행 시각>/` 아래에 저장되며 기본 출력 경로는 Git에서 무시한다.
+### Phase 2: 상태 분류 head 학습
 
-- `best.pt`: validation accuracy가 가장 높은 체크포인트. 동률이면 먼저 저장한 모델 유지.
-- `last.pt`: 가장 최근 검증 시점의 체크포인트. 정상 완료 시 마지막 학습 step과 일치.
-- `config.json`: 해당 실행의 설정과 클래스 매핑, 전처리 정보.
-- `metrics.jsonl`: 검증 시점별 epoch/step, train/validation loss와 accuracy.
-
-체크포인트에는 `model_state_dict`, `optimizer_state_dict`, epoch/step,
-검증 지표 및 `config`가 포함된다. 저장한 모델을 다시 사용할 때는
-`PillClassifier(pretrained=False)`를 생성해 `model_state_dict`를 로드하고,
-저장된 입력 크기와 정규화 설정으로 전처리한 뒤 `model.eval()`에서 추론한다.
-
-임시 이미지와 무작위 초기화 모델만 사용하는 오프라인 검증:
+Phase 1의 `best.pt`를 불러와 backbone과 count head를 고정하고, 상태 head를 새로 초기화해 학습한다.
 
 ```bash
-python3 -m unittest discover -s tests -v
+python training/train_phase2.py
 ```
 
-## 설치 / 실행
+- 체크포인트: `training/checkpoints/phase2/`
+- 학습 결과: `training/results/phase2/`
+- `best.pt`: 두 head를 포함한 모델 가중치, best epoch, 검증 지표, 학습 설정을 저장한다.
+- `data_selection.json`: 선택한 학습·검증 이미지, 상태 매핑, 샘플링 설정, 데이터 지문을 저장한다.
+- Best 선택 우선순위는 **높은 balanced accuracy → 적은 false accept → 낮은 validation loss**다.
+
+기존 결과를 보존하며 다시 학습하려면 새로운 출력 경로를 지정한다.
 
 ```bash
-pip install -r requirements.txt
-python -c "from detector.interface import detect; print(detect(1))"
-pytest
+python training/train_phase2.py \
+  --checkpoint-dir training/checkpoints/phase2_run2 \
+  --results-dir training/results/phase2_run2
 ```
 
-## 연동 (RPi SW)
+다른 Phase 1 모델을 사용하려면 `--phase1-checkpoint <체크포인트 경로>`를 추가한다. 현재 Phase 2 스크립트는 기존 Phase 2 head를 이어서 학습하는 방식이 아니다.
 
-`detect(compartment_id) -> DetectResult(compartment_id, has_pill, confidence, captured_at)` 만 호출한다.
-시그니처와 필드는 고정. 백엔드는 `detector/config.yaml`의 `detector.backend` (`dummy` / `baseline` / `model`)로 바꾼다.
-기본 `dummy`는 항상 `has_pill=True, confidence=1.0`. `baseline`/`model`은 구현 전이라 `NotImplementedError`출력
-이미지는 디스크에 저장하지 않는다.
+### 학습 동작 확인 및 추론
 
-## 할 일
+1epoch 동작 확인은 임시 출력 폴더를 사용한다. Phase 2 확인에는 실제 Phase 1 체크포인트가 필요하다.
 
-- [ ] `detector/camera.py` — `capture` (webcam / picamera2 / file 모드)
-- [ ] `samples/` — 빈 칸 / 알약 있는 칸 사진 수집
-- [ ] `detector/preprocess.py` — `crop_roi`, `resize`, `normalize_brightness`
-- [ ] `detector/baseline.py` — `register_baseline`, `compare` (OpenCV 기준 이미지 비교 판별)
-- [ ] 평가 스크립트 (신규) — `samples/empty`, `samples/filled`로 정확도 측정
-- [ ] `detector/config.yaml` — 칸별 ROI, 임계값 조정
-- [ ] (추후) `detector/model.py` — `load_model`, `predict` (규칙 기반이 부족할 때만)
+```bash
+python training/train_phase1.py --smoke-test
+python training/train_phase2.py --smoke-test
+```
 
-## 작업 우선순위
+학습된 모델의 이미지별 예측과 정확도는 다음 명령으로 확인한다.
 
-1. 뼈대 (완료)
-2. `camera.py` + 사진 수집
-3. `baseline.py` + 평가
-4. (선택) `model.py`
+```bash
+python -m training.test_inference
+```
+
+`training/test_inference.py`의 `CHECKPOINT_NAME = None`이면 `phase2/best.pt`, `phase1/best.pt`, 구형 체크포인트 순으로 탐색한다. 새 실행 결과를 평가하려면 다음처럼 이름을 지정한다.
+
+```python
+CHECKPOINT_NAME = "phase2_run2/best.pt"
+```
+
+GUI가 없는 환경에서는 같은 파일의 `SHOW_GUI = False`로 설정한다. 추론에서도 224×224 PNG 규격과 학습 시 정규화를 그대로 사용한다.
+
+## 학습 결과와 지표
+
+**2026-11-22 현재 로컬에 저장된 실행 결과**다. 아래 값은 `training/results/phase1/evaluation_summary.json`과 `training/results/phase2/evaluation_summary.json`을 기준으로 작성했다. `before_phase12_split`의 과거 실험 결과는 포함하지 않는다.
+
+### Phase 1: 개수 분류
+
+| 지표 | 결과 |
+|---|---:|
+| 학습 이미지 | 16,000장 |
+| 검증 이미지 | 84장, class0~6 |
+| 실제 완료 epoch / 최대 epoch | 10 / 30 |
+| Best epoch | 3 |
+| 검증 정확도 | **95.24% (80/84)** |
+| 검증 loss | 0.139010 |
+| MAE | 0.047619개 |
+| False empty rate | **0.00% (0/72)** |
+
+MAE는 예측 개수와 실제 개수의 차이에 대한 절댓값의 평균이다. False empty rate는 알약이 있는 이미지 중 0개로 잘못 예측한 비율이다.
+
+| 실제 개수 | 정답 / 검증 수 | 정확도 |
+|---|---:|---:|
+| 0개 | 12/12 | 100.00% |
+| 1개 | 12/12 | 100.00% |
+| 2개 | 12/12 | 100.00% |
+| 3개 | 12/12 | 100.00% |
+| 4개 | 12/12 | 100.00% |
+| 5개 | 11/12 | 91.67% |
+| 6개 | 9/12 | 75.00% |
+| 7개 | 0/0 | 미평가 |
+
+오류 4건은 모두 1개 적게 예측한 경우다. 실제 5개 이미지 1장을 4개로, 실제 6개 이미지 3장을 5개로 예측했다.
+
+### Phase 2: 상태 분류
+
+빈 통 표본을 256장으로 확대한 현재 설정의 학습 결과다.
+
+| 지표 | 결과 |
+|---|---:|
+| 선택한 학습 이미지 | 348장 |
+| 검증 이미지 | 108장 |
+| 실제 완료 epoch / 최대 epoch | 100 / 100 |
+| Best epoch | 100 |
+| 검증 정확도 | **100.00% (108/108)** |
+| Balanced accuracy | **100.00%** |
+| 검증 loss | 0.008956 |
+| False accept rate | **0.00% (0/24)** |
+| False reject rate | **0.00% (0/84)** |
+
+Balanced accuracy는 세 상태의 재현율을 평균한 값이다. False accept는 손 가림·뚜껑 닫힘을 계수 가능으로 잘못 허용한 경우이며, false reject는 계수 가능한 이미지를 손 가림·뚜껑 닫힘으로 잘못 거부한 경우다.
+
+상태 혼동 행렬의 행은 실제 상태, 열은 예측 상태다.
+
+| 실제 상태 ∖ 예측 상태 | 계수 가능 | 손 가림 | 뚜껑 닫힘 |
+|---|---:|---:|---:|
+| 계수 가능 | 84 | 0 | 0 |
+| 손 가림 | 0 | 12 | 0 |
+| 뚜껑 닫힘 | 0 | 0 | 12 |
+
+### 두 head를 함께 사용한 최종 판정
+
+현재 `phase2/best.pt`를 `test_inference.py`로 다시 평가한 결과, **상태와 개수를 함께 반영한 최종 정확도는 96.30% (104/108)**다. 상태 분류는 108장을 모두 맞혔으며, 개수 분류 오류 4건이 남아 있다. Phase 2의 상태 정확도 100%와 최종 개수 판정 정확도는 구분해서 해석해야 한다.
+
+현재 `test` 폴더는 두 Phase의 체크포인트 선택에도 사용한다. 따라서 위 값은 독립 테스트 성능이 아닌 검증 성능이다. class7 실촬영 표본은 없으며, 실제 운영 성능을 확인하려면 학습·검증과 촬영 세션을 분리한 데이터를 추가로 평가해야 한다. 픽셀 해시 검사는 완전히 동일한 이미지의 중복을 검사하며, 같은 촬영의 유사 프레임까지 분리해 주지는 않는다.
