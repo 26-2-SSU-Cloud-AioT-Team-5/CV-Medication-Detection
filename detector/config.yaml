@@ -1,5 +1,5 @@
 model:
-  path: null              # export_onnx.py로 만든 .onnx 경로 (저장소 루트 기준)
+  path: models/phase2_best.onnx   # git에 안 올림. Pi에는 scp로 복사
   input_size: [224, 224]  # (width, height). 학습 입력 크기
 
 # 뚜껑 열림/닫힘 판단과 개수 확정 (detector/watcher.py). 실제 사진으로 조정할 값

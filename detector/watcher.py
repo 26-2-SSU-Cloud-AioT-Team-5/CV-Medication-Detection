@@ -38,8 +38,9 @@ def is_open(crop: np.ndarray, dark_level: int, open_dark_ratio: float) -> bool:
 def stable_result(history: list, frames: int, min_conf: float) -> Optional[tuple]:
     # 같은 개수가 frames장 연속 conf >= min_conf로 나온 구간 중 가장 최근 것의 마지막 (개수, conf, 시각)
     best, run = None, 0
+    # 셀 수 없는 사진(count None: 손 가림 등)은 구간을 끊는다
     for i, (count, conf, _) in enumerate(history):
-        if conf < min_conf:
+        if count is None or conf < min_conf:
             run = 0
             continue
         run = run + 1 if run and history[i - 1][0] == count else 1

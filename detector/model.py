@@ -1,6 +1,7 @@
 # 학습 모델 실행 (ONNX Runtime, RPi 기기 내 추론). 모델 규격은 README 참고.
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import onnxruntime as ort
@@ -24,14 +25,23 @@ def preprocess(crop: np.ndarray, input_size: tuple[int, int]) -> np.ndarray:
 
 
 def predict(session: ort.InferenceSession, crop: np.ndarray,
-            input_size: tuple[int, int] = (224, 224)) -> tuple[int, float]:
-    # 칸 하나의 BGR 크롭 -> (개수, confidence 0~1). 출력 (1, K) 로짓, 인덱스 = 개수
-    logits = session.run(None, {session.get_inputs()[0].name: preprocess(crop, input_size)})[0]
-    if logits.ndim != 2 or logits.shape[0] != 1:
-        raise ValueError(f"모델 출력 shape이 (1, K)가 아님: {logits.shape}")
-
-    z = logits[0].astype(np.float64)
-    p = np.exp(z - z.max())  # 최댓값을 빼서 overflow 방지
-    p /= p.sum()
+            input_size: tuple[int, int] = (224, 224)) -> tuple[Optional[int], float]:
+    # 칸 하나의 BGR 크롭 -> (개수, confidence 0~1).
+    # 출력 0: 개수 로짓 (1, K), 인덱스 = 개수. 출력 1(Phase 2 모델만): 상태 로짓 (1, 3)
+    # 상태가 countable(0)이 아니면(손 가림, 뚜껑 닫힘) 개수 None, confidence는 그 상태의 확률
+    outputs = session.run(None, {session.get_inputs()[0].name: preprocess(crop, input_size)})
+    if len(outputs) > 1:
+        status = _softmax(outputs[1])
+        if status.argmax() != 0:
+            return None, float(status.max())
+    p = _softmax(outputs[0])
     count = int(p.argmax())
     return count, float(p[count])
+
+
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    if logits.ndim != 2 or logits.shape[0] != 1:
+        raise ValueError(f"모델 출력 shape이 (1, K)가 아님: {logits.shape}")
+    z = logits[0].astype(np.float64)
+    p = np.exp(z - z.max())  # 최댓값을 빼서 overflow 방지
+    return p / p.sum()

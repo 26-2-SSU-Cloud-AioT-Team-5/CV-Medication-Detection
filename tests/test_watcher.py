@@ -27,7 +27,8 @@ def watcher(monkeypatch):
 
     def fake_count(cfg, crop):
         calls.append(crop)
-        return int(crop[0, 0, 0]), crop[0, 0, 1] / 100
+        count = int(crop[0, 0, 0])
+        return (None if count == 9 else count), crop[0, 0, 1] / 100  # B=9 -> 셀 수 없음(손 가림)
 
     monkeypatch.setattr(wm, "_count", fake_count)
     w = PillboxWatcher(CFG)
@@ -48,6 +49,13 @@ def test_confirms_latest_stable_count_on_close(watcher):
     e = events[0]
     assert (e.compartment_id, e.count, e.confidence, e.status, e.captured_at) == (2, 2, .94, "ok", 8)
     assert len(watcher.calls) == 9  # 모델은 열린 사진에만, 닫힌 칸 1에는 안 돌린다
+
+
+def test_hand_frame_breaks_stable_run(watcher):
+    # 손 가림(개수 None) 사진끼리 연속 2장이어도 확정하지 않는다
+    out = run(watcher, [frame(c2=c) for c in [(3, .95), (9, .99), (9, .99), None, None]])
+    (e,) = out[4]
+    assert e.status == "uncertain"
 
 
 def test_uncertain_when_never_stable(watcher):

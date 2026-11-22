@@ -2,6 +2,7 @@
 # 촬영과 서버 전송은 RPi SW 담당. 이미지는 디스크에 저장하지 않는다.
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import yaml
@@ -14,7 +15,7 @@ CONFIG_PATH = Path(__file__).with_name("config.yaml")
 @dataclass
 class CountResult:
     compartment_id: int   # 1~4
-    count: int            # 0~7
+    count: Optional[int]  # 0~7. 손 가림/뚜껑 닫힘으로 셀 수 없으면 None
     confidence: float     # 0~1
 
 
@@ -41,7 +42,7 @@ def _crop(image: np.ndarray, rois: dict, compartment_id: int) -> np.ndarray:
     return image[y:y + h, x:x + w]
 
 
-def _count(cfg: dict, crop: np.ndarray) -> tuple[int, float]:
+def _count(cfg: dict, crop: np.ndarray) -> tuple[Optional[int], float]:
     if not cfg["model"].get("path"):
         raise RuntimeError("config.yaml의 model.path가 비어 있음. export_onnx.py로 만든 .onnx 경로를 적을 것")
     return model.predict(model.load_model(cfg["model"]["path"]), crop, tuple(cfg["model"]["input_size"]))
