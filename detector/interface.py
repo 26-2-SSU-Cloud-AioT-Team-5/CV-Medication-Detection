@@ -23,15 +23,13 @@ def _load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def count_pills(image: np.ndarray, compartment_id: int) -> CountResult:
-    # image: 통 전체 BGR 이미지 (H, W, 3, uint8), compartment_id: 뚜껑을 연 칸 번호
-    if not isinstance(image, np.ndarray) or image.dtype != np.uint8 or image.ndim != 3 \
-            or image.shape[2] != 3 or 0 in image.shape:
+def _check_image(image) -> None:
+    if not isinstance(image, np.ndarray) or image.dtype != np.uint8 or image.ndim != 3             or image.shape[2] != 3 or 0 in image.shape:
         desc = None if image is None else (getattr(image, "shape", type(image)), getattr(image, "dtype", None))
         raise ValueError(f"image는 (H, W, 3) uint8 BGR ndarray여야 함: {desc}")
 
-    cfg = _load_config()
-    rois = cfg["rois"]
+
+def _crop(image: np.ndarray, rois: dict, compartment_id: int) -> np.ndarray:
     if compartment_id not in rois:
         raise ValueError(f"compartment_id는 {sorted(rois)} 중 하나여야 함: {compartment_id!r}")
     roi = rois[compartment_id]
@@ -40,10 +38,18 @@ def count_pills(image: np.ndarray, compartment_id: int) -> CountResult:
     x, y, w, h = roi
     if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > image.shape[1] or y + h > image.shape[0]:
         raise ValueError(f"rois.{compartment_id} {roi}가 이미지 {image.shape[1]}x{image.shape[0]} 밖으로 나감")
+    return image[y:y + h, x:x + w]
+
+
+def _count(cfg: dict, crop: np.ndarray) -> tuple[int, float]:
     if not cfg["model"].get("path"):
         raise RuntimeError("config.yaml의 model.path가 비어 있음. export_onnx.py로 만든 .onnx 경로를 적을 것")
+    return model.predict(model.load_model(cfg["model"]["path"]), crop, tuple(cfg["model"]["input_size"]))
 
-    count, conf = model.predict(
-        model.load_model(cfg["model"]["path"]), image[y:y + h, x:x + w], tuple(cfg["model"]["input_size"])
-    )
+
+def count_pills(image: np.ndarray, compartment_id: int) -> CountResult:
+    # image: 통 전체 BGR 이미지 (H, W, 3, uint8), compartment_id: 뚜껑을 연 칸 번호
+    _check_image(image)
+    cfg = _load_config()
+    count, conf = _count(cfg, _crop(image, cfg["rois"], compartment_id))
     return CountResult(compartment_id, count, conf)

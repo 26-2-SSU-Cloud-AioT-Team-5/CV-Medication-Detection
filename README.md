@@ -12,19 +12,33 @@ pytest
 
 ## 연동 (RPi SW)
 
-RPi SW는 `count_pills(image, compartment_id)`만 호출한다. 촬영과 서버 전송(MQTT)은 RPi SW 담당이다.
+뚜껑 센서가 없어서 CV가 사진으로 칸 열림/닫힘을 판단하고, **뚜껑이 닫힐 때 칸별 개수를 확정**한다.
+RPi SW는 약 1초마다 통 전체를 찍어 `update`를 부르고, 나온 이벤트를 MQTT로 보내기만 한다.
 
 ```python
-from detector.interface import count_pills
+from dataclasses import asdict
+from detector.watcher import PillboxWatcher
 
-result = count_pills(image, 2)  # image: 통 전체 BGR (H, W, 3, uint8), 2: 뚜껑을 연 칸 번호(1~4)
-# CountResult(compartment_id=2, count=3, confidence=0.97)
+watcher = PillboxWatcher()   # 프로세스당 한 번 (모델도 한 번만 로드)
+while True:
+    for event in watcher.update(camera.capture(), datetime.now().astimezone()):
+        mqtt.publish(topic, json.dumps(asdict(event), default=str))
+    time.sleep(1)
+# CountEvent(compartment_id=2, count=2, confidence=0.94, status="ok", captured_at=...)
 ```
+
+- 칸마다 검은 바닥판이 보이면 열림, 흰 뚜껑이 보이면 닫힘. `switch_frames`장 연속이어야 상태를 바꾼다.
+- 열려 있는 동안 매 장 개수를 세고, 닫히면 **같은 개수가 `stable_frames`장 연속 `min_confidence` 이상인 가장 최근 구간**을 결과로 낸다.
+  손이 가린 사진이나 닫히는 중인 뚜껑은 이렇게 걸러진다.
+- 그런 구간이 없으면 `status="uncertain"`, `count=None`. 서버는 판정에 쓰지 않는다.
+- 서버는 칸별로 이번 `count`와 지난 `count`의 차이로 복용(줄어듦)/채움(늘어남)을 판정한다.
+- 기준값은 `config.yaml`의 `watcher`에서 바꾼다.
+
+한 칸만 바로 세고 싶으면 `count_pills(image, compartment_id) -> CountResult(compartment_id, count, confidence)`.
 
 - image의 shape/dtype이 맞지 않거나, 칸 번호가 config에 없거나, ROI가 이미지 밖이면 `ValueError`
 - `config.yaml`의 `model.path` 또는 해당 칸의 `rois`가 비어 있으면 `RuntimeError`
-- 촬영 시각은 RPi SW가 관리한다. 이미지는 디스크에 저장하지 않는다.
-- image는 학습 사진과 같은 카메라 위치·해상도여야 한다 (ROI가 픽셀 좌표).
+- 이미지는 디스크에 저장하지 않는다. image는 ROI를 잡은 사진과 같은 카메라 위치·해상도여야 한다.
 
 ## 칸 ROI 보정
 
