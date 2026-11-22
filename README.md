@@ -79,16 +79,18 @@ python -m detector.calibrate 사진.jpg --show   # 지금 rois를 사진에 그�
 
 RPi 기기 내 추론은 ONNX Runtime을 쓴다. RPi OS는 64-bit여야 한다 (PyPI에 32-bit ARM용 `onnxruntime` 없음).
 
-- 모델: `architecture/model.py`의 `build_model` (ResNet-18, 로짓 8개, 인덱스 = 알약 개수 0~7)
-- 변환: `python -m training.export_onnx <체크포인트.pt>` → 옆에 `.onnx` 생성. 그 경로를 `detector/config.yaml`의 `model.path`에 적는다.
-  - `best.pt`(state_dict)와 `last.pt`(`model_state_dict`) 둘 다 된다. ImageNet mean/std 정규화는 모델 안에 들어간다.
+- 모델: `architecture/model.py`의 `PillStateClassifier` (Phase 2, ResNet-18 + 개수 head 8 + 상태 head 3). Phase 1 `build_model`(개수만)도 된다.
+- 변환: `python -m training.export_onnx models/phase2_best.pt` → 옆에 `.onnx` 생성. 그 경로를 `detector/config.yaml`의 `model.path`에 적는다.
+  - 체크포인트와 `.onnx`는 git에 올리지 않는다 (`models/`). Pi에는 scp로 복사한다.
+  - ImageNet mean/std 정규화는 모델 안에 들어간다.
 - 전처리 (`detector/model.py`): `rois`의 `[x, y, w, h]`로 칸 크롭 → BGR→RGB → PIL LANCZOS로 224×224 → `/255` → `float32` `NCHW`
   - 학습 데이터(`resize_test.py`)와 같은 리사이즈를 쓴다. 비율이 바뀌어도 그대로 늘린다.
-- 출력: `(1, K)` 로짓. softmax 최댓값의 인덱스 = 개수, 그 확률 = confidence. 다른 shape이면 `ValueError`
+- 출력: `count_logits (1, 8)` (인덱스 = 개수), `status_logits (1, 3)` (`countable`, `hand_occlusion`, `lid_closed`)
+  - 상태가 `countable`이면 `(개수, 개수 확률)`, 아니면 `(None, 상태 확률)`. watcher는 `None` 사진을 안정 구간에서 뺀다.
 
 ## 남은 일
 
-- [ ] 학습 파트에서 체크포인트 받기 → ONNX 변환
+- [x] 학습 파트에서 체크포인트 받기 → ONNX 변환 (Phase 2)
 - [ ] 칸별 ROI 좌표 재기 (학습 때 크롭 좌표가 저장되지 않음) → `config.yaml`의 `rois`
 - [ ] 실제 RPi 사진으로 정확도 확인 (학습 검증은 합성 데이터만)
-- [ ] RPi에서 추론 시간 측정 (목표 5초 이내)
+- [x] RPi에서 추론 시간 측정 (랜덤 가중치: 1칸 열림 약 0.3초, 4칸 0.9초)
