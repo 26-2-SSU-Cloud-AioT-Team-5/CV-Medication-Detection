@@ -1,4 +1,4 @@
-"""Fixed, stratified ImageFolder splits with decoded-image duplicate protection."""
+"""Dataset loading and decoded-image duplicate protection."""
 
 from __future__ import annotations
 
@@ -12,11 +12,13 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from PIL import Image
-from torch.utils.data import Subset
+from torch.utils.data import Dataset, Subset
 from torchvision import datasets, transforms
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CLASS_TO_IDX = {f"class{label}": label for label in range(8)}
+VALIDATION_COUNT_FOLDERS = tuple(CLASS_TO_IDX)[:7]
+BLOCKED_FOLDERS = ("class_hand_occulusion", "class_lid_closed")
 PILL_TYPES = ("A", "B", "C", "D")
 IMAGE_SIZE = (224, 224)
 NORMALIZATION_MEAN = (0.485, 0.456, 0.406)
@@ -46,6 +48,48 @@ def build_transforms() -> transforms.Compose:
         transforms.ToTensor(),
         transforms.Normalize(NORMALIZATION_MEAN, NORMALIZATION_STD),
     ])
+
+
+def png_paths(directory: Path, minimum: int = 1) -> list[Path]:
+    """Find PNGs in stable relative-path order and check the sampling quota."""
+    paths = sorted(
+        (path for path in directory.rglob("*") if path.is_file() and path.suffix.lower() == ".png"),
+        key=lambda path: path.relative_to(directory).as_posix(),
+    )
+    if len(paths) < minimum:
+        raise ValueError(f"Need {minimum} PNG images in {directory}, found {len(paths)}.")
+    return paths
+
+
+class LabeledImages(Dataset):
+    """Load explicitly selected paths without inferring label indices from folders."""
+
+    def __init__(self, samples):
+        self.samples = samples
+        self.transform = build_transforms()
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        path, label = self.samples[index]
+        return self.transform(load_rgb(path)), label
+
+
+def inspect_image_splits(train_root, train_samples, val_root, val_samples) -> dict:
+    """Fingerprint the used images and check exact RGB overlap across splits."""
+    fingerprint = hashlib.sha256()
+    train_paths_by_hash = {}
+    for split, root, samples in (("train", train_root, train_samples), ("validation", val_root, val_samples)):
+        for path, label in samples:
+            digest = hashlib.sha256(load_rgb(path).tobytes()).hexdigest()
+            if split == "train":
+                train_paths_by_hash[digest] = path
+            elif digest in train_paths_by_hash:
+                raise ValueError(f"Identical training and validation images: {train_paths_by_hash[digest]} and {path}")
+            relative_path = path.relative_to(root).as_posix()
+            fingerprint.update(f"{split}\0{relative_path}\0{label}\0{digest}\n".encode("utf-8"))
+    return {"dataset_fingerprint": fingerprint.hexdigest(), "cross_split_duplicate_hashes": 0}
 
 
 def select_whole_groups(groups: list[list[int]], target: int,

@@ -1,4 +1,4 @@
-"""Generate and audit count-labelled pills with independent continuous rotations.
+"""Generate count-labelled pills, controlled contact, and whole-scene augmentation.
 
 Requires only NumPy and OpenCV; torchvision is optional for the loader check.
 Run modes in order: assets, masks, rotation, feasibility, pilot, full, validate.
@@ -9,6 +9,9 @@ validate to audit them, or choose a fresh --output-dir / --debug-dir for another
 run. A pre-existing, completely empty output directory may be used.
 Use --replace-generated to stage and validate a replacement, then retain the
 verified previous generated dataset as a backup. Real/unknown data is refused.
+Use --replace-count-classes for an explicitly authorized class0..class7
+replacement without a prior manifest: retain a full backup and preserve all
+other classes byte-for-byte. The sibling dataset/test is never a target.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import math
 import os
 from pathlib import Path
 import random
+import shutil
 import sys
 import time
 from typing import Optional
@@ -36,7 +40,7 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BACKGROUND_DIR = PROJECT_ROOT / "training/dataset_synth_prep/background"
 PILL_ASSET_DIR = PROJECT_ROOT / "training/dataset_synth_prep/pill_type/cropped_resized224"
-OUTPUT_DIR = PROJECT_ROOT / "training/dataset"
+OUTPUT_DIR = PROJECT_ROOT / "training/dataset/train_n_val"
 DEBUG_OUTPUT_DIR = PROJECT_ROOT / "training/dataset_synth_prep/generation_debug"
 
 # ============================================================
@@ -45,6 +49,7 @@ DEBUG_OUTPUT_DIR = PROJECT_ROOT / "training/dataset_synth_prep/generation_debug"
 IMAGE_SIZE = 224
 PILL_TYPES = ("A", "B", "C", "D")
 MAX_PILL_COUNT = 7
+TARGET_CLASSES = tuple(f"class{count}" for count in range(MAX_PILL_COUNT + 1))
 EXPECTED_BACKGROUNDS = 16
 EXPECTED_ASSETS_PER_TYPE = 8
 NUM_SAMPLES_PER_TYPE = 500
@@ -66,6 +71,9 @@ MAX_PLACEMENT_ATTEMPTS = 200
 MAX_IMAGE_RETRIES = 50
 MAX_LAYOUT_BACKTRACKS = 20  # Rotation only: undo prior positions, never angles/assets.
 FEASIBILITY_TRIALS = 20
+# Exact fraction within every class2..7/type stratum. Contact scenes contain
+# at least one edge-adjacent pair; the remaining scenes have no 8-neighbor contact.
+CONTACT_IMAGE_FRACTION = 0.30
 # Optional replacement floor polygons, before safety erosion, keyed by filename.
 # No overrides were needed for the supplied 16 backgrounds.
 MASK_POLYGONS: dict[str, list[tuple[int, int]]] = {}
@@ -83,6 +91,20 @@ PILL_ROTATION_RANGE = (0.0, 360.0)
 # T = S @ R @ inv(S), S = diag(224/W, 224/H). No guessed scale is used.
 PILL_ROI_SIZE: Optional[tuple[int, int]] = None
 ROTATION_PREVIEW_ANGLES = (0, 45, 90, 135, 180, 225, 270, 315)
+# These affect the COMPLETED 224x224 scene, including background and all pills.
+# 0.75 nonzero quarter-turn probability makes 0/90/180/270 equally likely.
+SCENE_ROTATION_PROB = 0.75
+SCENE_HORIZONTAL_FLIP_PROB = 0.50
+SCENE_LIGHTING_PROB = 0.50
+LIGHTING_GRADIENT_RANGE = (0.04, 0.10)  # Smooth directional gain +/-4..10%.
+SCENE_SHADOW_PROB = 0.35
+SHADOW_STRENGTH_RANGE = (0.10, 0.25)  # At most 25% local attenuation.
+SHADOW_RADIUS_RANGE = (0.30, 0.75)  # Gaussian sigma in normalized [-1,1] image coordinates.
+SCENE_GAIN_LIMITS = (0.65, 1.30)  # Combined brightness/lighting/shadow gain budget.
+SCENE_GRID_X, SCENE_GRID_Y = np.meshgrid(
+    np.linspace(-1.0, 1.0, IMAGE_SIZE, dtype=np.float32),
+    np.linspace(-1.0, 1.0, IMAGE_SIZE, dtype=np.float32),
+)
 SEED = 42
 PNG_COMPRESSION = 3
 LOG_EVERY = 100
@@ -205,6 +227,11 @@ def configuration(backgrounds: list[dict], pools: dict, samples: int, empty: int
         "pill_rotation_range": list(PILL_ROTATION_RANGE), "pill_roi_size": PILL_ROI_SIZE,
         "rotation_method": "S_R_inverse_S" if PILL_ROI_SIZE else "image_plane_2d_approximation",
         "rotation_interpolation": "one float32 premultiplied-alpha INTER_LINEAR affine",
+        "contact_image_fraction": CONTACT_IMAGE_FRACTION, "contact_definition": "8-neighbor alpha>0 adjacency, edge contact forced",
+        "scene_rotation_prob": SCENE_ROTATION_PROB, "scene_horizontal_flip_prob": SCENE_HORIZONTAL_FLIP_PROB,
+        "scene_lighting_prob": SCENE_LIGHTING_PROB, "lighting_gradient_range": LIGHTING_GRADIENT_RANGE,
+        "scene_shadow_prob": SCENE_SHADOW_PROB, "shadow_strength_range": SHADOW_STRENGTH_RANGE,
+        "shadow_radius_range": SHADOW_RADIUS_RANGE, "scene_gain_limits": SCENE_GAIN_LIMITS,
         "seed": SEED, "png_compression": PNG_COMPRESSION,
         "backgrounds": {b["id"]: b["sha256"] for b in backgrounds},
         "assets": {a["id"]: a["sha256"] for pool in pools.values() for a in pool},
@@ -439,14 +466,92 @@ def alpha_blend(image: np.ndarray, asset: dict, x: int, y: int) -> None:
     roi[:] = np.clip(np.rint(blended), 0, 255).astype(np.uint8)
 
 
-def apply_augmentation(image: np.ndarray, brightness: float, contrast: float) -> np.ndarray:
-    """Adjust contrast around whole-image luminance mean, then brightness."""
+def sample_scene_augmentation(rng: np.random.Generator) -> dict:
+    """Draw count/type-independent whole-scene effects, once per saved scene."""
+    scene = {"quarter_turns": 0, "horizontal_flip": False, "lighting": None, "shadow": None}
+    if SCENE_ROTATION_PROB > 0 and rng.random() < SCENE_ROTATION_PROB:
+        scene["quarter_turns"] = int(rng.integers(1, 4))
+    if SCENE_HORIZONTAL_FLIP_PROB > 0:
+        scene["horizontal_flip"] = bool(rng.random() < SCENE_HORIZONTAL_FLIP_PROB)
+    if SCENE_LIGHTING_PROB > 0 and rng.random() < SCENE_LIGHTING_PROB:
+        scene["lighting"] = {"angle": float(rng.uniform(0, 2 * math.pi)),
+                             "strength": float(rng.uniform(*LIGHTING_GRADIENT_RANGE))}
+    if SCENE_SHADOW_PROB > 0 and rng.random() < SCENE_SHADOW_PROB:
+        scene["shadow"] = {"angle": float(rng.uniform(0, 2 * math.pi)),
+                           "cx": float(rng.uniform(-1, 1)), "cy": float(rng.uniform(-1, 1)),
+                           "rx": float(rng.uniform(*SHADOW_RADIUS_RANGE)),
+                           "ry": float(rng.uniform(*SHADOW_RADIUS_RANGE)),
+                           "strength": float(rng.uniform(*SHADOW_STRENGTH_RANGE))}
+    return scene
+
+
+def validate_scene_parameters(scene: dict) -> None:
+    require(type(scene["quarter_turns"]) is int and 0 <= scene["quarter_turns"] <= 3,
+            "Scene rotation must be an integer quarter-turn")
+    require(type(scene["horizontal_flip"]) is bool, "Scene flip must be boolean")
+    for name in ("lighting", "shadow"):
+        params = scene[name]
+        if params is None:
+            continue
+        require(all(type(v) in (int, float) and math.isfinite(v) for v in params.values()), "Nonfinite scene parameter")
+        require(0 <= params["angle"] <= 2 * math.pi, "Invalid scene light/shadow angle")
+        limits = LIGHTING_GRADIENT_RANGE if name == "lighting" else SHADOW_STRENGTH_RANGE
+        require(limits[0] <= params["strength"] <= limits[1], "Invalid scene strength")
+        if name == "shadow":
+            require(-1 <= params["cx"] <= 1 and -1 <= params["cy"] <= 1
+                    and all(SHADOW_RADIUS_RANGE[0] <= params[key] <= SHADOW_RADIUS_RANGE[1] for key in ("rx", "ry")),
+                    "Invalid soft shadow geometry")
+
+
+def apply_scene_geometry(array: np.ndarray, scene: dict) -> np.ndarray:
+    """Permute image or mask pixels exactly; positive quarter-turns are clockwise."""
+    result = np.rot90(array, -scene["quarter_turns"])
+    if scene["horizontal_flip"]:
+        result = result[:, ::-1]
+    return np.ascontiguousarray(result)
+
+
+def scene_gain_map(scene: dict, brightness: float) -> np.ndarray:
+    """Return a smooth bounded exposure field, never an opaque occluding object."""
+    gain = np.ones((IMAGE_SIZE, IMAGE_SIZE), np.float32)
+    light = scene["lighting"]
+    if light is not None:
+        c, s = math.cos(light["angle"]), math.sin(light["angle"])
+        projection = (c * SCENE_GRID_X + s * SCENE_GRID_Y) / (abs(c) + abs(s))
+        gain *= 1.0 + light["strength"] * projection
+    shadow = scene["shadow"]
+    if shadow is not None:
+        c, s = math.cos(shadow["angle"]), math.sin(shadow["angle"])
+        dx, dy = SCENE_GRID_X - shadow["cx"], SCENE_GRID_Y - shadow["cy"]
+        radius_squared = ((c * dx + s * dy) / shadow["rx"]) ** 2 + ((-s * dx + c * dy) / shadow["ry"]) ** 2
+        gain *= 1.0 - shadow["strength"] * np.exp(-0.5 * radius_squared)
+    return np.clip(gain * brightness, *SCENE_GAIN_LIMITS)
+
+
+def apply_augmentation(image: np.ndarray, brightness: float, contrast: float,
+                       scene: Optional[dict] = None) -> np.ndarray:
+    """Apply whole-scene contrast and exposure once, clipping only the final RGB."""
     gray_mean = float(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).mean())
-    adjusted = ((image.astype(np.float32) - gray_mean) * contrast + gray_mean) * brightness
+    adjusted = (image.astype(np.float32) - gray_mean) * contrast + gray_mean
+    if scene is None or (scene["lighting"] is None and scene["shadow"] is None):
+        adjusted *= brightness
+    else:
+        adjusted *= scene_gain_map(scene, brightness)[:, :, None]
     return np.clip(np.rint(adjusted), 0, 255).astype(np.uint8)
 
 
-def replay_record(record: dict, backgrounds: dict, assets: dict) -> np.ndarray:
+def find_contact_pairs(masks: list[np.ndarray]) -> list[list[int]]:
+    """Count instance adjacency, not connected components, using every alpha>0 pixel."""
+    pairs = []
+    for i, mask in enumerate(masks):
+        band = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        for j in range(i + 1, len(masks)):
+            if bool((band & masks[j]).any()):
+                pairs.append([i, j])
+    return pairs
+
+
+def replay_record(record: dict, backgrounds: dict, assets: dict, audit: Optional[dict] = None) -> np.ndarray:
     """Audit geometry/labels from metadata and independently reconstruct pixels."""
     count = record["count"]
     pill_type = record["pill_type"]
@@ -459,6 +564,10 @@ def replay_record(record: dict, backgrounds: dict, assets: dict) -> np.ndarray:
     background = backgrounds[record["background"]]
     image = background["image"].copy()
     occupancy = np.zeros((IMAGE_SIZE, IMAGE_SIZE), bool)
+    instance_masks = []
+    contact_mode = record.get("contact_requested")
+    require(contact_mode is None or type(contact_mode) is bool, "Invalid contact mode")
+    require(not contact_mode or count >= 2, "Contact requires at least two pills")
     # Dilate the union of placed pixels once per check, avoiding cumulative
     # dilation of older pills when a positive gap is configured.
     for placement in record["placements"]:
@@ -480,19 +589,45 @@ def replay_record(record: dict, backgrounds: dict, assets: dict) -> np.ndarray:
         require(is_valid_placement(background["mask"], forbidden, asset["mask"], x, y),
                 f"Invalid alpha boundary / overlap / gap: {record.get('file')}")
         update_occupancy_mask(occupancy, asset["mask"], x, y)
+        full_mask = np.zeros_like(occupancy)
+        full_mask[y:y+asset["height"], x:x+asset["width"]] = asset["mask"]
+        instance_masks.append(full_mask)
         alpha_blend(image, asset, x, y)
-    return apply_augmentation(image, brightness, contrast)
+    contacts = find_contact_pairs(instance_masks)
+    if contact_mode is not None:
+        require(bool(contacts) == contact_mode, "Saved layout does not match requested contact mode")
+    scene = record.get("scene", {"quarter_turns": 0, "horizontal_flip": False, "lighting": None, "shadow": None})
+    validate_scene_parameters(scene)
+    image = apply_scene_geometry(image, scene)
+    allowed = apply_scene_geometry(background["mask"], scene)
+    transformed_masks = [apply_scene_geometry(mask, scene) for mask in instance_masks]
+    transformed_occupancy = np.zeros_like(occupancy)
+    for mask in transformed_masks:
+        require(not bool((mask & ~allowed).any()) and not bool((mask & transformed_occupancy).any()),
+                "Scene transform changed boundary or collision validity")
+        transformed_occupancy |= mask
+    require(find_contact_pairs(transformed_masks) == contacts, "Scene transform changed contact relationships")
+    result = apply_augmentation(image, brightness, contrast, scene)
+    gain = scene_gain_map(scene, brightness)
+    render_audit = {"contact_pairs": contacts, "gain_min": float(gain.min()), "gain_max": float(gain.max()),
+                    "clipped_channel_fraction": float(((result == 0) | (result == 255)).mean())}
+    if "render_audit" in record:
+        require(record["render_audit"] == render_audit, "Saved render audit differs from replay")
+    if audit is not None:
+        audit.update(render_audit)
+    return result
 
 
-def exclusion_mask(occupancy: np.ndarray) -> np.ndarray:
-    if not MIN_PILL_GAP:
+def exclusion_mask(occupancy: np.ndarray, gap: Optional[int] = None) -> np.ndarray:
+    gap = MIN_PILL_GAP if gap is None else gap
+    if not gap:
         return occupancy
     return cv2.dilate(occupancy.astype(np.uint8),
-                      np.ones((2 * MIN_PILL_GAP + 1,) * 2, np.uint8)) > 0
+                      np.ones((2 * gap + 1,) * 2, np.uint8)) > 0
 
 
 def place_rotated_assets(background: dict, selected: list[dict], rng: np.random.Generator,
-                         cache: dict, stats: Counter) -> Optional[list[dict]]:
+                         cache: dict, stats: Counter, contact_mode: Optional[bool] = None) -> Optional[list[dict]]:
     """Search exact free alpha positions with bounded backtracking of locations.
 
     Assets and angles stay fixed. Each pill has at most 200 coordinate attempts
@@ -506,7 +641,7 @@ def place_rotated_assets(background: dict, selected: list[dict], rng: np.random.
         if depth == len(selected):
             return []
         asset = selected[depth]
-        forbidden = exclusion_mask(occupancy)
+        forbidden = exclusion_mask(occupancy, max(MIN_PILL_GAP, 1) if contact_mode is False else MIN_PILL_GAP)
         if depth == 0:
             positions = candidate_positions(background, asset, cache)
         else:
@@ -515,6 +650,14 @@ def place_rotated_assets(background: dict, selected: list[dict], rng: np.random.
             free_background = {"id": background["id"], "mask": background["mask"] & ~forbidden}
             positions = candidate_positions(free_background, asset, {})
             stats["free_position_searches"] += 1
+        if contact_mode and depth == 1 and len(positions):
+            # Require an edge-adjacent second instance, without sharing any alpha
+            # pixel. The remaining pills may form additional contact pairs.
+            band = cv2.dilate(occupancy.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)))
+            touching = cv2.dilate(band, asset["mask"].astype(np.uint8), anchor=(0, 0),
+                                  borderType=cv2.BORDER_CONSTANT, borderValue=0)
+            positions = positions[touching[positions[:, 0], positions[:, 1]] > 0]
+            stats["contact_position_searches"] += 1
         if len(positions) == 0:
             stats["no_boundary_candidate" if depth == 0 else "occupancy_dead_ends"] += 1
             return None
@@ -528,7 +671,7 @@ def place_rotated_assets(background: dict, selected: list[dict], rng: np.random.
             update_occupancy_mask(next_occupancy, asset["mask"], x, y)
             tail = search(depth + 1, next_occupancy)
             if tail is not None:
-                return [{"asset": asset["id"], "x": x, "y": y, "angle": asset["angle"],
+                return [{"asset": asset["id"], "x": x, "y": y, "angle": asset.get("angle", 0.0),
                          "transformed_size": [asset["width"], asset["height"]],
                          "transform_sha256": sha256(asset["image"].tobytes())}] + tail
             if remaining_backtracks[0] <= 0:
@@ -542,7 +685,8 @@ def place_rotated_assets(background: dict, selected: list[dict], rng: np.random.
 
 
 def generate_single_image(background: dict, pool: list[dict], count: int,
-                          rng: np.random.Generator, cache: dict) -> tuple[Optional[dict], Counter]:
+                          rng: np.random.Generator, cache: dict,
+                          contact_mode: Optional[bool] = None) -> tuple[Optional[dict], Counter]:
     """Sample one type with replacement; restart bounded layouts, never relax constraints."""
     stats = Counter()
     selected = [pool[int(rng.integers(len(pool)))] for _ in range(count)]
@@ -561,10 +705,11 @@ def generate_single_image(background: dict, pool: list[dict], count: int,
         stats["layout_attempts"] += 1
         occupancy = np.zeros((IMAGE_SIZE, IMAGE_SIZE), bool)
         placements = []
-        if ENABLE_PILL_ROTATION:
-            result = place_rotated_assets(background, selected, rng, position_cache, stats)
+        use_search = ENABLE_PILL_ROTATION or contact_mode is not None
+        if use_search:
+            result = place_rotated_assets(background, selected, rng, position_cache, stats, contact_mode)
             placements = result if result is not None else []
-        for asset in (() if ENABLE_PILL_ROTATION else selected):
+        for asset in (() if use_search else selected):
             positions = candidate_positions(background, asset, position_cache)
             if len(positions) == 0:
                 stats["no_boundary_candidate"] += 1
@@ -595,7 +740,8 @@ def generate_single_image(background: dict, pool: list[dict], count: int,
                     "pill_type": pool[0]["type"] if count else None,
                     "placements": placements,
                     "brightness": float(rng.uniform(*BRIGHTNESS_RANGE)),
-                    "contrast": float(rng.uniform(*CONTRAST_RANGE))}, stats
+                    "contrast": float(rng.uniform(*CONTRAST_RANGE)),
+                    "contact_requested": contact_mode, "scene": sample_scene_augmentation(rng)}, stats
         stats["failed_layouts"] += 1
         if stats["no_boundary_candidate"]:
             break
@@ -605,7 +751,7 @@ def generate_single_image(background: dict, pool: list[dict], count: int,
 
 def check_placement_feasibility(backgrounds: list[dict], pools: dict, cache: dict,
                                 directory: Path, fingerprint: str) -> dict:
-    """Exercise 64 background/type pairs, with 20 independent seven-pill trials each."""
+    """Exercise all 64 background/type pairs in both contact modes, 20 trials each."""
     report_path = directory / "feasibility.json"
     if report_path.exists():
         report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -617,12 +763,13 @@ def check_placement_feasibility(backgrounds: list[dict], pools: dict, cache: dic
     bg_index = {b["id"]: b for b in backgrounds}
     asset_index = {a["id"]: a for pool in pools.values() for a in pool}
     for background in backgrounds:
-        for pill_type, pool in pools.items():
+        for pill_type, contact_mode in [(t, mode) for t in PILL_TYPES for mode in (False, True)]:
+            pool = pools[pill_type]
             stats = Counter()
             successes = 0
             first = None
             for _ in range(FEASIBILITY_TRIALS):
-                record, trial_stats = generate_single_image(background, pool, MAX_PILL_COUNT, rng, cache)
+                record, trial_stats = generate_single_image(background, pool, MAX_PILL_COUNT, rng, cache, contact_mode)
                 stats.update(trial_stats)
                 if record is not None:
                     replay_record(record, bg_index, asset_index)
@@ -636,7 +783,7 @@ def check_placement_feasibility(backgrounds: list[dict], pools: dict, cache: dic
                 reason = ("proven area shortage" if smallest_area > int(background["mask"].sum()) else
                           "sampled footprint has no boundary-valid position" if stats["no_boundary_candidate"] else
                           "bounded random packing exhausted; geometric impossibility NOT proven")
-            row = {"background": background["id"], "pill_type": pill_type,
+            row = {"background": background["id"], "pill_type": pill_type, "contact_requested": contact_mode,
                    "trials": FEASIBILITY_TRIALS, "successes": successes,
                    "success_rate": successes / FEASIBILITY_TRIALS,
                    "mean_layout_attempts": stats["layout_attempts"] / FEASIBILITY_TRIALS,
@@ -645,12 +792,12 @@ def check_placement_feasibility(backgrounds: list[dict], pools: dict, cache: dic
                    "candidate_counts": candidates, "witness": first}
             combinations.append(row)
             if first:
-                witness_tiles.append((background["id"].replace("_crop_224", "") + f" {pill_type}:7",
+                witness_tiles.append((background["id"].replace("_crop_224", "") + f" {pill_type}:7 {'touch' if contact_mode else 'apart'}",
                                       replay_record(first, bg_index, asset_index)))
-            print(f"[feasibility] {background['id']} {pill_type}: {successes}/{FEASIBILITY_TRIALS}, "
+            print(f"[feasibility] {background['id']} {pill_type} contact={contact_mode}: {successes}/{FEASIBILITY_TRIALS}, "
                   f"mean layouts={row['mean_layout_attempts']:.2f}, "
                   f"positions={row['mean_position_attempts']:.1f}", flush=True)
-    passed = len(combinations) == EXPECTED_BACKGROUNDS * len(PILL_TYPES) and all(
+    passed = len(combinations) == EXPECTED_BACKGROUNDS * len(PILL_TYPES) * 2 and all(
         row["successes"] == FEASIBILITY_TRIALS and min(row["candidate_counts"].values()) > 0
         for row in combinations)
     report = {"fingerprint": fingerprint, "status": "PASS" if passed else "FAIL",
@@ -676,10 +823,13 @@ def generate_dataset(backgrounds: list[dict], pools: dict, cache: dict, output: 
     evidence.mkdir(parents=True, exist_ok=False)
     for count in range(MAX_PILL_COUNT + 1):
         (output / f"class{count}").mkdir()
+    contact_samples = int(math.floor(samples * CONTACT_IMAGE_FRACTION + 0.5))
     spec = {"fingerprint": fingerprint, "output": str(output), "samples_per_type": samples,
+            "contact_samples_per_type": contact_samples,
             "empty_samples": empty, "seed": seed, "status": "INCOMPLETE until validation.json is PASS"}
     write_once(evidence / "run.json", json_bytes(spec))
     rng = np.random.default_rng(seed)
+    contact_rng = np.random.default_rng(seed + 1000)
     stats = Counter()
     bg_index = {b["id"]: b for b in backgrounds}
     asset_index = {a["id"]: a for pool in pools.values() for a in pool}
@@ -688,10 +838,14 @@ def generate_dataset(backgrounds: list[dict], pools: dict, cache: dict, output: 
     with (evidence / "placements.jsonl").open("x", encoding="utf-8") as manifest:
         for count in range(MAX_PILL_COUNT + 1):
             for pill_type in (PILL_TYPES if count else (None,)):
+                amount = samples if count else empty
+                contact_flags = np.zeros(amount, bool)
+                if count >= 2 and contact_samples:
+                    contact_flags[contact_rng.choice(amount, contact_samples, replace=False)] = True
                 for index in range(1, (samples if count else empty) + 1):
                     background = backgrounds[int(rng.integers(len(backgrounds)))]
                     record, image_stats = generate_single_image(
-                        background, pools[pill_type] if count else [], count, rng, cache)
+                        background, pools[pill_type] if count else [], count, rng, cache, bool(contact_flags[index - 1]))
                     stats.update(image_stats)
                     if record is None:
                         write_once(evidence / "failure.json", json_bytes({"class": count, "type": pill_type,
@@ -702,7 +856,9 @@ def generate_dataset(backgrounds: list[dict], pools: dict, cache: dict, output: 
                     record["file"] = f"class{count}/{name}"
                     # This independent audit also renders the image. It checks
                     # actual sampled native masks, never just the requested count.
-                    image = replay_record(record, bg_index, asset_index)
+                    render_audit = {}
+                    image = replay_record(record, bg_index, asset_index, render_audit)
+                    record["render_audit"] = render_audit
                     data = encode_png(image)
                     record["png_sha256"] = sha256(data)
                     write_once(output / record["file"], data)
@@ -750,21 +906,33 @@ def validate_dataset(backgrounds: list[dict], pools: dict, output: Path, evidenc
                 for c in range(MAX_PILL_COUNT + 1)
                 for t in (PILL_TYPES if c else ("empty",))
                 for i in range(1, (samples if c else empty) + 1)}
-    require(set(p.name for p in output.iterdir() if p.name not in {".DS_Store", ".gitkeep"}) ==
-            {f"class{c}" for c in range(MAX_PILL_COUNT + 1)},
-            "Dataset root must contain exactly class0..class7")
+    preservation_path = evidence / "preservation.json"
+    preservation = json.loads(preservation_path.read_text()) if preservation_path.exists() else {"files": {}, "directories": []}
+    for relative, digest in preservation["files"].items():
+        path = output / relative
+        require(path.is_file() and not path.is_symlink() and sha256(path.read_bytes()) == digest,
+                f"Preserved non-target file changed: {path}")
+    allowed_roots = set(TARGET_CLASSES) | {Path(p).parts[0] for p in preservation["files"]} | {
+        Path(p).parts[0] for p in preservation["directories"]}
+    require(set(p.name for p in output.iterdir() if p.name not in {".DS_Store", ".gitkeep"}) <= allowed_roots,
+            "Unexpected content outside target classes and registered preserved data")
     actual = set()
-    for class_dir in output.iterdir():
-        if class_dir.name in {".DS_Store", ".gitkeep"} and class_dir.is_file() and not class_dir.is_symlink():
-            continue
+    for class_dir in (output / name for name in TARGET_CLASSES):
         require(class_dir.is_dir() and not class_dir.is_symlink(), f"Invalid class directory: {class_dir}")
         for path in class_dir.iterdir():
+            if path.relative_to(output).as_posix() in preservation["files"]:
+                continue
             if path.name in {".DS_Store", ".gitkeep"} and path.is_file() and not path.is_symlink():
                 continue
             require(path.is_file() and not path.is_symlink() and path.suffix == ".png",
                     f"Unexpected nested directory or non-PNG: {path}")
             actual.add(path.relative_to(output).as_posix())
     require(actual == expected, f"File inventory mismatch: missing={len(expected-actual)}, extra={len(actual-expected)}")
+    all_files = {p.relative_to(output).as_posix() for p in output.rglob("*") if p.is_file()
+                 and p.name not in {".DS_Store", ".gitkeep"}}
+    registered = expected | set(preservation["files"])
+    require(all_files <= registered and not any(p.is_symlink() for p in output.rglob("*")),
+            "Unregistered file or symlink in final dataset")
     bg_index = {b["id"]: b for b in backgrounds}
     asset_index = {a["id"]: a for pool in pools.values() for a in pool}
     seen = set()
@@ -772,6 +940,10 @@ def validate_dataset(backgrounds: list[dict], pools: dict, output: Path, evidenc
     types = Counter()
     backgrounds_used = Counter()
     angle_groups: dict[str, list[float]] = {}
+    contact_counts = Counter()
+    effect_counts = Counter()
+    effects_by_class = {name: Counter() for name in TARGET_CLASSES}
+    gain_extrema = [float("inf"), float("-inf")]
     with (evidence / "placements.jsonl").open(encoding="utf-8") as manifest:
         for line in manifest:
             record = json.loads(line)
@@ -796,6 +968,19 @@ def validate_dataset(backgrounds: list[dict], pools: dict, output: Path, evidenc
             counts[f"class{count}"] += 1
             types[f"class{count}/{pill_type or 'empty'}"] += 1
             backgrounds_used[record["background"]] += 1
+            contacts = record["render_audit"]["contact_pairs"]
+            if contacts:
+                contact_counts[f"class{count}/{pill_type}"] += 1
+            scene = record["scene"]
+            effect_counts[f"rotation_{scene['quarter_turns'] * 90}"] += 1
+            effect_counts[f"geometry_r{scene['quarter_turns']}_h{int(scene['horizontal_flip'])}"] += 1
+            for key, present in (("horizontal_flip", scene["horizontal_flip"]),
+                                 ("lighting", scene["lighting"] is not None), ("shadow", scene["shadow"] is not None),
+                                 ("contact", bool(contacts))):
+                effect_counts[key] += int(present)
+                effects_by_class[f"class{count}"][key] += int(present)
+            gain_extrema[0] = min(gain_extrema[0], record["render_audit"]["gain_min"])
+            gain_extrema[1] = max(gain_extrema[1], record["render_audit"]["gain_max"])
             if ENABLE_PILL_ROTATION:
                 for placement in record["placements"]:
                     for group in ("overall", f"type/{pill_type}", f"background/{record['background']}",
@@ -807,6 +992,8 @@ def validate_dataset(backgrounds: list[dict], pools: dict, output: Path, evidenc
     require(all(counts[f"class{c}"] == empty for c in range(MAX_PILL_COUNT + 1)), "Class imbalance")
     require(all(types[f"class{c}/{t}"] == samples for c in range(1, MAX_PILL_COUNT + 1) for t in PILL_TYPES),
             "Pill type imbalance")
+    require(all(contact_counts[f"class{c}/{t}"] == spec["contact_samples_per_type"]
+                for c in range(2, MAX_PILL_COUNT + 1) for t in PILL_TYPES), "Contact ratio quota mismatch")
     # Structural compatibility is mandatory. Exercise actual torchvision when
     # installed, without introducing it as a generator dependency.
     loader_check = "NOT VERIFIED (torchvision unavailable); exact ImageFolder structure PASS"
@@ -815,7 +1002,11 @@ def validate_dataset(backgrounds: list[dict], pools: dict, output: Path, evidenc
     except (ImportError, RuntimeError, OSError) as exc:
         loader_check += f"; {type(exc).__name__}: {exc}"
     else:
-        dataset = ImageFolder(str(output))
+        class CountImageFolder(ImageFolder):
+            def find_classes(self, directory):
+                return list(TARGET_CLASSES), {name: i for i, name in enumerate(TARGET_CLASSES)}
+
+        dataset = CountImageFolder(str(output))
         require(dataset.class_to_idx == {f"class{c}": c for c in range(MAX_PILL_COUNT + 1)}
                 and len(dataset) == len(expected), "ImageFolder label map/count mismatch")
         for c in range(MAX_PILL_COUNT + 1):
@@ -823,14 +1014,19 @@ def validate_dataset(backgrounds: list[dict], pools: dict, output: Path, evidenc
             image, label = dataset[index]
             require(image.mode == "RGB" and image.size == (224, 224) and label == c,
                     "ImageFolder image decode mismatch")
-        loader_check = "PASS: torchvision ImageFolder, class map, total, one RGB decode per class"
+        loader_check = "PASS: torchvision ImageFolder with explicit class0..class7 selection, class map, total, RGB decode/class"
     report = {"fingerprint": fingerprint, "status": "PASS", "total": len(seen),
               "class_counts": dict(sorted(counts.items())), "type_counts": dict(sorted(types.items())),
               "background_counts": dict(sorted(backgrounds_used.items())), "imagefolder": loader_check,
+              "contact_counts": dict(sorted(contact_counts.items())), "contact_samples_per_type": spec["contact_samples_per_type"],
+              "scene_effect_counts": dict(sorted(effect_counts.items())),
+              "scene_effects_by_class": {name: dict(counts) for name, counts in effects_by_class.items()},
+              "observed_gain_range": gain_extrema, "preserved_files": len(preservation["files"]),
               "checks": {key: "PASS" for key in ["exact_class_directories", "class_balance", "type_balance",
                          "png_decode", "rgb_224x224", "unique_relative_paths", "single_type_per_image",
                          "count_matches_label", "full_alpha_boundary", "alpha_nonoverlap", "minimum_gap",
-                         "no_arbitrary_scaling", "saved_pixels_match_metadata_replay", "transformed_alpha_validity"]},
+                         "no_arbitrary_scaling", "saved_pixels_match_metadata_replay", "transformed_alpha_validity",
+                         "controlled_contact_quota", "scene_mask_geometry", "scene_parameter_ranges", "preserved_non_target_data"]},
               "rotation_method": "S_R_inverse_S" if PILL_ROI_SIZE else "image_plane_2d_approximation",
               "visual_quality": "NOT VERIFIED by automation; inspect saved contact sheets",
               "filename_policy": "Indices repeat across class directories as specified; relative paths are unique."}
@@ -892,6 +1088,49 @@ def verify_generated_dataset_for_replacement(output: Path, debug: Path) -> dict:
     raise ValueError("No complete matching generation manifest; existing dataset is protected")
 
 
+def snapshot_count_dataset(output: Path) -> dict:
+    """Snapshot an explicitly authorized target, without inferring image provenance.
+
+    Every existing file is retained in the full backup. Only images in the eight
+    named count classes are replaced; other classes and nonimage files survive.
+    """
+    require(output.is_dir() and not output.is_symlink(), "Count-class replacement requires a real directory")
+    require(all((output / name).is_dir() for name in TARGET_CLASSES), "Missing authorized count-class directories")
+    image_extensions = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+    files, preserved, directories = {}, {}, []
+    for path in sorted(output.rglob("*")):
+        require(not path.is_symlink(), f"Symlink in replacement target: {path}")
+        relative = path.relative_to(output).as_posix()
+        if path.is_dir():
+            directories.append(relative)
+        elif path.is_file():
+            digest = sha256(path.read_bytes())
+            files[relative] = digest
+            if Path(relative).parts[0] not in TARGET_CLASSES or path.suffix.lower() not in image_extensions:
+                preserved[relative] = digest
+        else:
+            raise ValueError(f"Unsupported filesystem entry: {path}")
+    return {"mode": "count_classes", "output": str(output), "files": files, "directories": directories,
+            "preserved_files": preserved,
+            "preserved_directories": [d for d in directories if Path(d).parts[0] not in TARGET_CLASSES],
+            "note": "Explicit --replace-count-classes authorization; old image provenance is not inferred."}
+
+
+def preserve_non_target_content(output: Path, staging: Path, evidence: Path, snapshot: dict) -> None:
+    """Copy registered non-target files exactly, before validating/publishing staging."""
+    for relative in snapshot["preserved_directories"]:
+        (staging / relative).mkdir(parents=True, exist_ok=True)
+    for relative, digest in snapshot["preserved_files"].items():
+        source, target = output / relative, staging / relative
+        require(sha256(source.read_bytes()) == digest, f"Non-target data changed during generation: {source}")
+        require(not target.exists(), f"Protected file collides with generated data: {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        require(sha256(target.read_bytes()) == digest, f"Non-target copy mismatch: {target}")
+    write_once(evidence / "preservation.json", json_bytes({"files": snapshot["preserved_files"],
+               "directories": snapshot["preserved_directories"]}))
+
+
 def publish_validated_replacement(staging: Path, output: Path, evidence: Path,
                                   fingerprint: str, previous: dict, debug: Path) -> None:
     """Retain the entire old dataset, move the validated new one, roll back on error."""
@@ -901,7 +1140,8 @@ def publish_validated_replacement(staging: Path, output: Path, evidence: Path,
     validation = json.loads((evidence / "validation.json").read_text(encoding="utf-8"))
     require(validation["status"] == "PASS" and validation["fingerprint"] == fingerprint, "Staging is not validated")
     # Recheck just before swapping, so edits made during generation are protected.
-    latest = verify_generated_dataset_for_replacement(output, debug)
+    latest = (snapshot_count_dataset(output) if previous.get("mode") == "count_classes" else
+              verify_generated_dataset_for_replacement(output, debug))
     require(latest == previous, "Existing dataset changed during regeneration")
     journal = {"fingerprint": fingerprint, "output": str(output), "staging_output": str(staging),
                "previous_dataset": str(backup), "previous_generation": previous,
@@ -916,7 +1156,8 @@ def publish_validated_replacement(staging: Path, output: Path, evidence: Path,
     print(f"[replace] Published {output}; previous dataset retained at {backup}", flush=True)
 
 
-def generate_dataset_previews(output: Path, evidence: Path) -> None:
+def generate_dataset_previews(output: Path, evidence: Path,
+                              backgrounds: Optional[list[dict]] = None, pools: Optional[dict] = None) -> None:
     tiles = []
     for count in range(MAX_PILL_COUNT + 1):
         for pill_type in (PILL_TYPES if count else ("empty",) * len(PILL_TYPES)):
@@ -933,6 +1174,48 @@ def generate_dataset_previews(output: Path, evidence: Path) -> None:
                 for path in sorted((output / f"class{count}").glob(f"{pill_type}_*.png")):
                     tiles.append((f"class{count} {path.stem}", read_image(path)))
             write_once(evidence / f"all_{pill_type}.png", encode_png(contact_sheet(tiles, PILOT_NUM_SAMPLES_PER_TYPE)), True)
+    chosen = {}
+    base_record = None
+    with (evidence / "placements.jsonl").open(encoding="utf-8") as manifest:
+        for line in manifest:
+            record = json.loads(line)
+            if record["count"] in (2, 7):
+                key = (record["count"], record["pill_type"], record["contact_requested"])
+                chosen.setdefault(key, record)
+            if base_record is None and record["count"] == 3 and record["pill_type"] == "C":
+                base_record = record
+    tiles = [(f"c{c} {t} {'touch' if mode else 'apart'}", read_image(output / record["file"]))
+             for (c, t, mode), record in sorted(chosen.items())]
+    if tiles:
+        write_once(evidence / "contact_preview.png", encode_png(contact_sheet(tiles, 4)), True)
+    if base_record is not None and backgrounds is not None and pools is not None:
+        bg_index = {b["id"]: b for b in backgrounds}
+        asset_index = {a["id"]: a for pool in pools.values() for a in pool}
+        identity = {"quarter_turns": 0, "horizontal_flip": False, "lighting": None, "shadow": None}
+        light = {"angle": 0.0, "strength": LIGHTING_GRADIENT_RANGE[1]}
+        shadow = {"angle": math.pi / 4, "cx": 0.0, "cy": 0.0, "rx": 0.5, "ry": 0.5,
+                  "strength": SHADOW_STRENGTH_RANGE[1]}
+        for key in ("rx", "ry"):
+            shadow[key] = float(np.clip(shadow[key], *SHADOW_RADIUS_RANGE))
+        variants = [("base", identity), ("scene clockwise 90", {**identity, "quarter_turns": 1}),
+                    ("scene clockwise 180", {**identity, "quarter_turns": 2}),
+                    ("scene clockwise 270", {**identity, "quarter_turns": 3}),
+                    ("scene horizontal flip", {**identity, "horizontal_flip": True}),
+                    ("directional lighting", {**identity, "lighting": light}),
+                    ("soft local shadow", {**identity, "shadow": shadow}),
+                    ("rotation + flip + light/shadow", {**identity, "quarter_turns": 1,
+                     "horizontal_flip": True, "lighting": light, "shadow": shadow})]
+        tiles, details = [], []
+        for label, scene in variants:
+            record = {key: value for key, value in base_record.items() if key != "render_audit"}
+            record["scene"] = scene
+            record["brightness"] = float(np.clip(1.0, *BRIGHTNESS_RANGE))
+            record["contrast"] = float(np.clip(1.0, *CONTRAST_RANGE))
+            audit = {}
+            tiles.append((label, replay_record(record, bg_index, asset_index, audit)))
+            details.append({"label": label, "source_scene": record["file"], "scene": scene, "audit": audit})
+        write_once(evidence / "scene_effects_preview.png", encode_png(contact_sheet(tiles, 4)), True)
+        write_once(evidence / "scene_effects_preview.json", json_bytes(details), True)
 
 
 def resolve_path(value: Path) -> Path:
@@ -949,6 +1232,8 @@ def main() -> None:
     parser.add_argument("--samples-per-type", type=int, default=NUM_SAMPLES_PER_TYPE, help="Full dataset samples per type/count")
     parser.add_argument("--reviewed-previews", action="store_true", help="Assert mask and pilot previews have been visually reviewed")
     parser.add_argument("--replace-generated", action="store_true", help="Stage/validate a replacement; retain the verified old dataset as backup")
+    parser.add_argument("--replace-count-classes", action="store_true",
+                        help="Explicitly replace only class0..class7; retain full backup and preserve other classes")
     args = parser.parse_args()
     require(args.samples_per_type > 0, "--samples-per-type must be positive")
     require(BOUNDARY_MARGIN >= 0 and MIN_PILL_GAP >= 0 and ALPHA_THRESHOLD == 0,
@@ -961,7 +1246,21 @@ def main() -> None:
             and 0 < CONTRAST_RANGE[0] <= CONTRAST_RANGE[1], "Invalid brightness/contrast ranges")
     require(0.0 <= PILL_ROTATION_RANGE[0] < PILL_ROTATION_RANGE[1] <= 360.0, "Invalid rotation interval")
     require(not args.replace_generated or args.mode == "full", "--replace-generated is only valid with --mode full")
+    require(not args.replace_count_classes or args.mode == "full", "--replace-count-classes is only valid with --mode full")
+    require(not (args.replace_count_classes and args.replace_generated), "Choose one replacement policy")
+    require(0 <= CONTACT_IMAGE_FRACTION <= 1, "Contact fraction must be in [0,1]")
+    require(not CONTACT_IMAGE_FRACTION or MIN_PILL_GAP == 0, "Contact scenes require MIN_PILL_GAP=0")
+    require(all(0 <= p <= 1 for p in (SCENE_ROTATION_PROB, SCENE_HORIZONTAL_FLIP_PROB,
+                                     SCENE_LIGHTING_PROB, SCENE_SHADOW_PROB)), "Scene probabilities must be in [0,1]")
+    require(0 <= LIGHTING_GRADIENT_RANGE[0] <= LIGHTING_GRADIENT_RANGE[1] < 1
+            and 0 <= SHADOW_STRENGTH_RANGE[0] <= SHADOW_STRENGTH_RANGE[1] < 1
+            and 0 < SHADOW_RADIUS_RANGE[0] <= SHADOW_RADIUS_RANGE[1], "Invalid scene lighting/shadow ranges")
+    require(0 < SCENE_GAIN_LIMITS[0] <= BRIGHTNESS_RANGE[0] <= BRIGHTNESS_RANGE[1] <= SCENE_GAIN_LIMITS[1],
+            "Gain budget must contain the configured brightness range")
     output, debug = resolve_path(args.output_dir), resolve_path(args.debug_dir)
+    protected_test = (PROJECT_ROOT / "training/dataset/test").resolve()
+    require(all(path != protected_test and protected_test not in path.parents and path not in protected_test.parents
+                for path in (output, debug)), "The existing test dataset and its ancestors are protected")
     require(output != debug and output not in debug.parents and debug not in output.parents,
             "Debug artifacts must be outside the ImageFolder dataset")
     for source in (BACKGROUND_DIR.resolve(), PILL_ASSET_DIR.resolve()):
@@ -1008,19 +1307,24 @@ def main() -> None:
         generate_dataset(backgrounds, pools, cache, pilot_output, pilot_evidence,
                          PILOT_NUM_SAMPLES_PER_TYPE, PILOT_NUM_SAMPLES_PER_TYPE * len(PILL_TYPES), fingerprint, SEED + 2)
         validate_dataset(backgrounds, pools, pilot_output, pilot_evidence, fingerprint)
-        generate_dataset_previews(pilot_output, pilot_evidence)
+        generate_dataset_previews(pilot_output, pilot_evidence, backgrounds, pools)
     elif args.mode == "full":
         require(args.reviewed_previews, "Inspect mask, rotation and pilot previews, then pass --reviewed-previews")
         # Re-audit the entire pilot rather than trusting a stale PASS file.
         validate_dataset(backgrounds, pools, pilot_output, pilot_evidence, fingerprint)
-        generate_dataset_previews(pilot_output, pilot_evidence)
+        generate_dataset_previews(pilot_output, pilot_evidence, backgrounds, pools)
         evidence = run_dir / "full"
         full_start = time.perf_counter()
-        previous = verify_generated_dataset_for_replacement(output, debug) if args.replace_generated else None
+        previous = (snapshot_count_dataset(output) if args.replace_count_classes else
+                    verify_generated_dataset_for_replacement(output, debug) if args.replace_generated else None)
+        if previous:
+            write_once(run_dir / "replacement_snapshot.json", json_bytes(previous), True)
         generation_output = run_dir / "staging_dataset" if previous else output
         generate_dataset(backgrounds, pools, cache, generation_output, evidence,
                          args.samples_per_type, empty, fingerprint, SEED)
-        if previous:
+        if previous and previous.get("mode") == "count_classes":
+            preserve_non_target_content(output, generation_output, evidence, previous)
+        elif previous:
             for relative, digest in previous["preserved_markers"].items():
                 data = (output / relative).read_bytes()
                 require(sha256(data) == digest, "Tracked dataset marker changed during generation")
@@ -1029,7 +1333,7 @@ def main() -> None:
         if previous:
             publish_validated_replacement(generation_output, output, evidence, fingerprint, previous, debug)
             validate_dataset(backgrounds, pools, output, evidence, fingerprint)
-        generate_dataset_previews(output, evidence)
+        generate_dataset_previews(output, evidence, backgrounds, pools)
         write_once(evidence / "preview_review.json", json_bytes({"fingerprint": fingerprint,
                    "mask_rotation_and_pilot_review_asserted": True, "method": "--reviewed-previews",
                    "note": "This records operator review, not an automated visual-quality judgment."}))
@@ -1039,7 +1343,7 @@ def main() -> None:
         selected_output = pilot_output if args.target == "pilot" else output
         selected_evidence = pilot_evidence if args.target == "pilot" else run_dir / "full"
         validate_dataset(backgrounds, pools, selected_output, selected_evidence, fingerprint)
-        generate_dataset_previews(selected_output, selected_evidence)
+        generate_dataset_previews(selected_output, selected_evidence, backgrounds, pools)
 
 
 if __name__ == "__main__":

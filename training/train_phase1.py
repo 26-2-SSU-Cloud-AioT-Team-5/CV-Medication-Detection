@@ -1,11 +1,10 @@
 """Eight-class pill-count training. Edit globals below, then run this file.
 
-python training/train.py --smoke-test   # short, offline run in a temporary directory
-python training/train.py               # full configured training
+python training/train_phase1.py --smoke-test
+python training/train_phase1.py
 
 Existing outputs are never reused. For another run, set BOTH output directories
-to fresh paths. Synthetic validation measures synthetic performance only; an
-independently captured real-world test set is needed before deployment.
+to fresh paths. Validation uses real captures of counts 0 through 6.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # ==============================================================================================
@@ -36,17 +35,15 @@ from tqdm import tqdm
 TRAINING_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TRAINING_DIR.parent
 DATASET_DIR = TRAINING_DIR / "dataset" / "train_n_val"
-CHECKPOINT_DIR = TRAINING_DIR / "checkpoints"
-RESULTS_DIR = TRAINING_DIR / "results"
+VALIDATION_DIR = TRAINING_DIR / "dataset" / "test"
+CHECKPOINT_DIR = TRAINING_DIR / "checkpoints" / "phase1"
+RESULTS_DIR = TRAINING_DIR / "results" / "phase1"
 
 # ============================================================
 # Model / Dataset Configuration
 # ============================================================
 NUM_CLASSES = 8
 USE_PRETRAINED = True
-
-NUM_VAL_SAMPLES = 1600
-SPLIT_SEED = 42
 
 # ============================================================
 # Training Configuration
@@ -80,18 +77,21 @@ DETERMINISTIC_TRAINING = True
 
 # ==============================================================================================
 
-# Both direct execution and `python -m training.train` work from any directory.
+# Support direct execution and `python -m training.train_phase1`.
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 from architecture.model import build_model
-from training.dataset_sampler import CLASS_TO_IDX, PILL_TYPES, PREPROCESSING, DatasetSampler
+from training.dataset_sampler import (
+    CLASS_TO_IDX, PREPROCESSING, VALIDATION_COUNT_FOLDERS, LabeledImages,
+    inspect_image_splits, png_paths,
+)
 
 HISTORY_FIELDS = (
     "epoch", "train_loss", "train_acc", "val_loss", "val_acc", "val_mae",
     "false_empty_rate", "lr", "epoch_time_sec", "best_val_acc",
 )
 CONFIG_NAMES = (
-    "NUM_CLASSES", "USE_PRETRAINED", "NUM_VAL_SAMPLES", "SPLIT_SEED",
+    "NUM_CLASSES", "USE_PRETRAINED",
     "NUM_EPOCHS", "TRAIN_BATCH_SIZE", "VAL_BATCH_SIZE", "LEARNING_RATE",
     "WEIGHT_DECAY", "MIN_LEARNING_RATE", "NUM_WORKERS", "TRAIN_SEED",
     "ENABLE_EARLY_STOPPING", "EARLY_STOPPING_PATIENCE", "DEVICE",
@@ -117,15 +117,11 @@ def validate_settings(config: dict) -> None:
             raise ValueError(f"{name} must be finite and nonnegative.")
     if not 0 < config["MIN_LEARNING_RATE"] <= config["LEARNING_RATE"]:
         raise ValueError("Require 0 < MIN_LEARNING_RATE <= LEARNING_RATE.")
-    for name in ("SPLIT_SEED", "TRAIN_SEED"):
-        if type(config[name]) is not int or not 0 <= config[name] < 2**32:
-            raise ValueError(f"{name} must be an integer in [0, 2**32).")
+    if type(config["TRAIN_SEED"]) is not int or not 0 <= config["TRAIN_SEED"] < 2**32:
+        raise ValueError("TRAIN_SEED must be an integer in [0, 2**32).")
     for name in ("USE_PRETRAINED", "ENABLE_EARLY_STOPPING", "ENABLE_AMP", "DETERMINISTIC_TRAINING"):
         if type(config[name]) is not bool:
             raise ValueError(f"{name} must be a boolean.")
-    if (type(config["NUM_VAL_SAMPLES"]) is not int or config["NUM_VAL_SAMPLES"] <= 0
-            or config["NUM_VAL_SAMPLES"] % 32):
-        raise ValueError("NUM_VAL_SAMPLES must be a positive multiple of 32.")
 
 
 def resolve_device(preference: str) -> torch.device:
@@ -163,37 +159,28 @@ def seed_worker(worker_id: int) -> None:
     np.random.seed(worker_seed)
 
 
-def create_loaders(sampler: DatasetSampler, device: torch.device, config: dict,
-                   smoke_test: bool = False) -> tuple:
-    train_indices, val_indices = sampler.train_indices, sampler.val_indices
-    train_dataset, val_dataset = sampler.get_train_dataset(), sampler.get_val_dataset()
-    if smoke_test:
-        # One sample per class/type, including empty: 29 samples per split.
-        def representatives(indices):
-            seen, selected = set(), []
-            for index in indices:
-                meta = sampler.metadata[index]
-                key = (meta["label"], meta["pill_type"])
-                if key not in seen:
-                    selected.append(index)
-                    seen.add(key)
-            return selected
-        train_indices, val_indices = representatives(train_indices), representatives(val_indices)
-        train_dataset = Subset(sampler.dataset, train_indices)
-        val_dataset = Subset(sampler.dataset, val_indices)
+def collect_count_samples(root, folders, *, smoke_test: bool = False):
+    samples = []
+    for folder in folders:
+        paths = png_paths(root / folder)
+        samples.extend((path, CLASS_TO_IDX[folder]) for path in (paths[:1] if smoke_test else paths))
+    return samples
+
+
+def create_loaders(train_samples, val_samples, device: torch.device, config: dict) -> tuple:
     common = {
         "num_workers": config["NUM_WORKERS"], "pin_memory": device.type == "cuda",
         "drop_last": False, "worker_init_fn": seed_worker,
     }
     train_loader = DataLoader(
-        train_dataset, batch_size=config["TRAIN_BATCH_SIZE"], shuffle=True,
+        LabeledImages(train_samples), batch_size=config["TRAIN_BATCH_SIZE"], shuffle=True,
         generator=torch.Generator().manual_seed(config["TRAIN_SEED"]), **common,
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=config["VAL_BATCH_SIZE"], shuffle=False,
+        LabeledImages(val_samples), batch_size=config["VAL_BATCH_SIZE"], shuffle=False,
         generator=torch.Generator().manual_seed(config["TRAIN_SEED"] + 1), **common,
     )
-    return train_loader, val_loader, [sampler.metadata[i] for i in val_indices]
+    return train_loader, val_loader
 
 
 def train_one_epoch(model, train_loader, criterion, optimizer, device, scaler) -> dict:
@@ -221,13 +208,11 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, scaler) -
 
 
 @torch.inference_mode()
-def validate(model, val_loader, criterion, device, metadata=None) -> dict:
-    """Evaluate in FP32; optional metadata follows the unshuffled loader order."""
+def validate(model, val_loader, criterion, device) -> dict:
+    """Evaluate the eight-way model on the configured validation records in FP32."""
     model.eval()
     loss_sum = absolute_error = false_empty = nonempty = total = 0
     confusion = torch.zeros((len(CLASS_TO_IDX), len(CLASS_TO_IDX)), dtype=torch.long)
-    type_correct = {pill: 0 for pill in PILL_TYPES}
-    type_total = {pill: 0 for pill in PILL_TYPES}
     for images, labels in tqdm(val_loader, desc="Validate", leave=False):
         images = images.to(device, non_blocking=device.type == "cuda")
         labels = labels.to(device, dtype=torch.long, non_blocking=device.type == "cuda")
@@ -244,22 +229,9 @@ def validate(model, val_loader, criterion, device, metadata=None) -> dict:
         truth, predicted = labels.cpu(), predictions.cpu()
         confusion += torch.bincount(truth * len(CLASS_TO_IDX) + predicted,
                                     minlength=len(CLASS_TO_IDX)**2).reshape_as(confusion)
-        if metadata is not None:
-            batch_meta = metadata[total:total + count]
-            if len(batch_meta) != count:
-                raise ValueError("Validation metadata length does not match loader.")
-            for meta, label, prediction in zip(batch_meta, truth.tolist(), predicted.tolist()):
-                if meta["label"] != label:
-                    raise ValueError("Validation metadata order does not match labels.")
-                pill = meta["pill_type"]
-                if label > 0:
-                    type_total[pill] += 1
-                    type_correct[pill] += label == prediction
         total += count
     if not total:
         raise ValueError("Validation loader is empty.")
-    if metadata is not None and len(metadata) != total:
-        raise ValueError("Unused validation metadata; loader did not evaluate the whole subset.")
     class_totals = confusion.sum(dim=1)
     return {
         "loss": loss_sum / total, "accuracy": confusion.diag().sum().item() / total,
@@ -268,14 +240,11 @@ def validate(model, val_loader, criterion, device, metadata=None) -> dict:
         "class_accuracy": {f"class{i}": confusion[i, i].item() / n if n else None
                            for i, n in enumerate(class_totals.tolist())},
         "class_samples": dict(zip(CLASS_TO_IDX, class_totals.tolist())),
-        "pill_type_accuracy": {pill: type_correct[pill] / n if n else None
-                               for pill, n in type_total.items()} if metadata is not None else None,
-        "pill_type_samples": type_total if metadata is not None else None,
         "confusion_matrix": confusion.tolist(),
     }
 
 
-def atomic_save(value, path: Path, *, as_json: bool = False) -> None:
+def atomic_save(value, path: Path, *, as_json: bool = False, exclusive: bool = False) -> None:
     """Replace only after the complete file is flushed in the same directory."""
     temporary = None
     try:
@@ -287,7 +256,10 @@ def atomic_save(value, path: Path, *, as_json: bool = False) -> None:
                 torch.save(value, stream)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        if exclusive:
+            os.link(temporary, path)
+        else:
+            os.replace(temporary, path)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -368,12 +340,12 @@ def snapshot_state(model) -> dict:
     return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
 
 
-def run_training(sampler: DatasetSampler, config: dict, device: torch.device,
+def run_training(train_samples, val_samples, manifest: dict, config: dict, device: torch.device,
                  checkpoint_dir: Path, results_dir: Path, *, smoke_test: bool = False) -> dict:
     started = time.perf_counter()
     prepare_output_dirs(checkpoint_dir, results_dir)
-    sampler.save_validation_split(checkpoint_dir / "validation_split.json")
-    train_loader, val_loader, val_metadata = create_loaders(sampler, device, config, smoke_test)
+    atomic_save(manifest, checkpoint_dir / "validation_split.json", as_json=True, exclusive=True)
+    train_loader, val_loader = create_loaders(train_samples, val_samples, device, config)
     model = build_model(pretrained=config["USE_PRETRAINED"]).to(device)
     parameter_count = sum(p.numel() for p in model.parameters())
     trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -439,9 +411,9 @@ def run_training(sampler: DatasetSampler, config: dict, device: torch.device,
             "epoch": epoch, "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(), "scheduler_state_dict": scheduler.state_dict(),
             "best_val_acc": best_val_acc, "best_epoch": best_epoch,
-            "split_seed": config["SPLIT_SEED"], "train_seed": config["TRAIN_SEED"],
+            "train_seed": config["TRAIN_SEED"],
             "early_stopping_counter": patience_counter, "config": config,
-            "dataset_fingerprint": sampler.fingerprint, "preprocessing": PREPROCESSING,
+            "dataset_fingerprint": manifest["dataset_fingerprint"], "preprocessing": PREPROCESSING,
         }
         if scaler.is_enabled():
             last["scaler_state_dict"] = scaler.state_dict()
@@ -493,19 +465,18 @@ def run_training(sampler: DatasetSampler, config: dict, device: torch.device,
             rows = list(csv.DictReader(stream))
         smoke_check(len(rows) == len(history) and float(rows[0]["lr"]) == config["LEARNING_RATE"], "CSV rows and actual learning rate")
     best_model = best_model.to(device)
-    final_metrics = validate(best_model, val_loader, criterion, device, val_metadata)
+    final_metrics = validate(best_model, val_loader, criterion, device)
     summary = {
         "architecture": "ResNet-18 / Linear(512, 8) / raw logits",
         "best_epoch": best_epoch, "best_val_acc": best_val_acc,
         "evaluation": final_metrics, "train_samples": len(train_loader.dataset),
-        "val_samples": len(val_loader.dataset), "full_dataset_samples": len(sampler.dataset),
-        "full_train_samples": len(sampler.train_indices), "full_val_samples": len(sampler.val_indices),
-        "split_seed": config["SPLIT_SEED"], "train_seed": config["TRAIN_SEED"],
+        "val_samples": len(val_loader.dataset), "train_seed": config["TRAIN_SEED"],
         "preprocessing": PREPROCESSING, "config": config, "smoke_test": smoke_test,
         "device": str(device), "platform": platform.platform(), "torch_version": str(torch.__version__),
         "amp_active": amp_enabled, "parameters": parameter_count, "trainable_parameters": trainable_count,
-        "dataset_fingerprint": sampler.fingerprint, "duplicate_check": sampler.duplicate_summary,
-        "validation_scope": "Synthetic dataset only; not measured Raspberry Pi real-world accuracy.",
+        "dataset_fingerprint": manifest["dataset_fingerprint"],
+        "validation_count_folders": manifest["validation_count_folders"],
+        "validation_scope": "Real captures of counts 0 through 6 used for checkpoint selection.",
     }
     plot_results(history, final_metrics, best_epoch, results_dir)
     summary["total_time_sec"] = time.perf_counter() - started
@@ -531,28 +502,29 @@ def main(smoke_test: bool = False) -> dict:
         print("GPU backend: Apple Metal (MPS)")
     print(f"Configuration: {json.dumps(config, indent=2)}", flush=True)
     print("Deterministic kernels are enforced when requested; cross-hardware bitwise equality is not guaranteed.")
-    print("Synthetic validation does not establish real-world Raspberry Pi accuracy.", flush=True)
-    sampler = DatasetSampler(resolve_path(DATASET_DIR), config["NUM_VAL_SAMPLES"], config["SPLIT_SEED"])
-    print(json.dumps({key: value for key, value in sampler.split_manifest().items()
-                      if key != "validation_paths"}, indent=2), flush=True)
+    train_root, val_root = resolve_path(DATASET_DIR), resolve_path(VALIDATION_DIR)
+    train_samples = collect_count_samples(train_root, CLASS_TO_IDX, smoke_test=smoke_test)
+    val_samples = collect_count_samples(val_root, VALIDATION_COUNT_FOLDERS, smoke_test=smoke_test)
+    manifest = {
+        "schema_version": 2, "train_root": str(train_root), "validation_root": str(val_root),
+        "train_samples": len(train_samples), "validation_samples": len(val_samples),
+        "class_to_idx": CLASS_TO_IDX, "validation_count_folders": list(VALIDATION_COUNT_FOLDERS),
+        "validation_paths": [path.relative_to(val_root).as_posix() for path, _ in val_samples],
+        "preprocessing": PREPROCESSING,
+        **inspect_image_splits(train_root, train_samples, val_root, val_samples),
+    }
+    print(f"Train: {len(train_samples)} images (class0–class7). "
+          f"Validation: {len(val_samples)} images (class0–class6).", flush=True)
     if smoke_test:
-        # Global training RNG activity must not affect the split-local generator.
-        random.random()
-        np.random.rand()
-        torch.rand(3)
-        second = DatasetSampler(resolve_path(DATASET_DIR), config["NUM_VAL_SAMPLES"], config["SPLIT_SEED"])
-        smoke_check(sampler.val_indices == second.val_indices and sampler.fingerprint == second.fingerprint,
-                    "same seed/dataset reproduces the validation split after training RNG use")
-        del second
-        seed_training(config["TRAIN_SEED"], config["DETERMINISTIC_TRAINING"])
-        temporary = Path(tempfile.mkdtemp(prefix="pill-count-smoke-"))
-        print(f"Smoke artifacts (separate from formal training): {temporary}", flush=True)
-        summary = run_training(sampler, config, device, temporary / "checkpoints",
-                               temporary / "results", smoke_test=True)
+        with tempfile.TemporaryDirectory(prefix="pill-count-smoke-") as workdir:
+            temporary = Path(workdir)
+            summary = run_training(train_samples, val_samples, manifest, config, device,
+                                   temporary / "checkpoints", temporary / "results", smoke_test=True)
         print("[PASS] CPU-loadable checkpoint, forward/backward, optimizer, validation isolation, CSV and plots.")
         print(f"AMP hardware verification: {'PASS' if summary['amp_active'] else 'NOT VERIFIED (CUDA AMP inactive)'}")
         return summary
-    return run_training(sampler, config, device, resolve_path(CHECKPOINT_DIR), resolve_path(RESULTS_DIR))
+    return run_training(train_samples, val_samples, manifest, config, device,
+                        resolve_path(CHECKPOINT_DIR), resolve_path(RESULTS_DIR))
 
 
 if __name__ == "__main__":
