@@ -7,7 +7,7 @@ watcher:
   dark_level: 100        # 크롭 픽셀 밝기(0~255)가 이보다 낮으면 바닥판으로 봄
   open_dark_ratio: 0.5   # 바닥판 픽셀 비율이 이 이상이면 열림 (pillcase 사진: 열림 0.94~0.95, 닫힘 0.00~0.04)
   switch_frames: 2       # 열림/닫힘이 이만큼 연속으로 나와야 상태를 바꿈
-  stable_frames: 3       # 같은 개수가 이만큼 연속이어야 확정
+  stable_frames: 2       # 같은 개수가 이만큼 연속이어야 확정 (1초 간격이면 뚜껑을 약 4초 이상 열어야 ok)
   min_confidence: 0.8    # 확정에 쓰는 사진의 최소 confidence
 
 # 칸별 크롭 영역 [x, y, w, h] (통 전체 사진의 픽셀 좌표, 학습 때 잘라낸 영역과 같아야 함)

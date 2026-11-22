@@ -7,7 +7,7 @@ from detector.watcher import PillboxWatcher, is_open, stable_result
 CFG = {
     "model": {"path": "unused.onnx", "input_size": [2, 2]},
     "watcher": {"dark_level": 100, "open_dark_ratio": 0.5, "switch_frames": 2,
-                "stable_frames": 3, "min_confidence": 0.8},
+                "stable_frames": 2, "min_confidence": 0.8},
     "rois": {1: [0, 0, 4, 4], 2: [4, 0, 4, 4]},
 }
 
@@ -51,7 +51,7 @@ def test_confirms_latest_stable_count_on_close(watcher):
 
 
 def test_uncertain_when_never_stable(watcher):
-    out = run(watcher, [frame(c2=c) for c in [(3, .95), (3, .95), (4, .5), None, None]])
+    out = run(watcher, [frame(c2=c) for c in [(3, .95), (4, .95), (4, .5), None, None]])
     (e,) = out[4]
     assert (e.compartment_id, e.count, e.confidence, e.status, e.captured_at) == (2, None, None, "uncertain", 4)
 
