@@ -1,8 +1,13 @@
-"""Train the frame-status head on features from a frozen Phase 1 checkpoint."""
+"""Train the frame-status head on features from a frozen Phase 1 checkpoint.
+
+Edit the globals below. For a new run, use fresh --checkpoint-dir and
+--results-dir paths; existing run files are never overwritten.
+"""
 
 from __future__ import annotations
 
 import argparse
+import math
 import random
 import sys
 import tempfile
@@ -10,7 +15,7 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 # ==============================================================================================
 
@@ -25,7 +30,14 @@ RESULTS_DIR = TRAINING_DIR / "results" / "phase2"
 SAMPLE_SEED = 42
 TRAIN_SEED = 42
 
-NUM_EPOCHS = 30
+NUM_EPOCHS = 100
+
+TRAIN_EMPTY_SAMPLES = 256
+TRAIN_COUNT_SAMPLES_PER_CLASS = 4  # Each of class1 through class7.
+
+ENABLE_EARLY_STOPPING = True
+EARLY_STOPPING_PATIENCE = 20
+EARLY_STOPPING_MIN_DELTA = 1e-4  # Minimum validation-loss improvement.
 
 BATCH_SIZE = 16
 
@@ -40,7 +52,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 from architecture.model import STATUS_NAMES, PillStateClassifier, load_model_state
 from training.dataset_sampler import (
-    BLOCKED_FOLDERS, CLASS_TO_IDX, PREPROCESSING, VALIDATION_COUNT_FOLDERS,
+    BLOCKED_FOLDERS, CLASS_TO_IDX, PREPROCESSING,
     LabeledImages, inspect_image_splits, png_paths,
 )
 from training.train_phase1 import (
@@ -50,19 +62,34 @@ from training.train_phase1 import (
 
 def collect_status_samples(root: Path, *, validation: bool, seed: int) -> list[tuple[Path, int]]:
     rng = random.Random(seed)
-    count_folders = VALIDATION_COUNT_FOLDERS if validation else CLASS_TO_IDX
-    quota = 2 if validation else 4
     samples = []
-    for folder in count_folders:
-        paths = png_paths(root / folder, minimum=quota)
-        samples.extend((path, 0) for path in sorted(rng.sample(paths, quota)))
+    for folder, count in CLASS_TO_IDX.items():
+        quota = TRAIN_EMPTY_SAMPLES if count == 0 else TRAIN_COUNT_SAMPLES_PER_CLASS
+        paths = png_paths(root / folder, minimum=0 if validation else quota)
+        selected = paths if validation else sorted(rng.sample(paths, quota))
+        samples.extend((path, 0) for path in selected)
+    if not samples:
+        raise ValueError(f"Need at least one countable PNG image in {root}.")
 
     for label, folder in enumerate(BLOCKED_FOLDERS, start=1):
-        paths = png_paths(root / folder, minimum=12 if validation else 1)
-        if validation and len(paths) != 12:
-            raise ValueError(f"Expected 12 validation PNG images in {root / folder}, found {len(paths)}.")
+        paths = png_paths(root / folder)
         samples.extend((path, label) for path in paths)
     return samples
+
+
+def build_status_sampler(labels, *, seed: int) -> WeightedRandomSampler:
+    """Give each status equal expected exposure despite unequal file counts.
+
+Draw one dataset-length epoch with replacement; minority examples may repeat
+and majority examples may be omitted in an individual epoch.
+"""
+    counts = torch.bincount(labels, minlength=len(STATUS_NAMES))
+    if (counts == 0).any().item():
+        raise ValueError("Phase 2 training requires examples of all three statuses.")
+    return WeightedRandomSampler(
+        weights=counts.double().reciprocal()[labels], num_samples=len(labels), replacement=True,
+        generator=torch.Generator().manual_seed(seed),
+    )
 
 
 @torch.no_grad()
@@ -119,8 +146,10 @@ def run_training(model, train_samples, val_samples, manifest, device, checkpoint
         frozen_before = snapshot_state(model.backbone)
         count_before = snapshot_state(model.count_head)
         status_before = snapshot_state(head)
+    train_features = extract_features(model, train_samples, device)
     train_loader = DataLoader(
-        extract_features(model, train_samples, device), batch_size=BATCH_SIZE, shuffle=True,
+        train_features, batch_size=BATCH_SIZE,
+        sampler=build_status_sampler(train_features.tensors[1], seed=TRAIN_SEED),
         generator=torch.Generator().manual_seed(TRAIN_SEED),
     )
     val_loader = DataLoader(extract_features(model, val_samples, device), batch_size=BATCH_SIZE)
@@ -128,7 +157,10 @@ def run_training(model, train_samples, val_samples, manifest, device, checkpoint
     optimizer = torch.optim.AdamW(head.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
     history = []
-    best_key = (-1.0, 0)
+    best_key = (-1.0, 0, -float("inf"))
+    lowest_loss = float("inf")
+    epochs_without_improvement = 0
+    stopped_early = False
     epochs = 1 if smoke_test else NUM_EPOCHS
     for epoch in range(1, epochs + 1):
         head.train()
@@ -144,17 +176,29 @@ def run_training(model, train_samples, val_samples, manifest, device, checkpoint
         metrics = validate_status(head, val_loader, criterion, device)
         record = {"epoch": epoch, "train_loss": loss_sum / len(train_samples), "validation": metrics}
         history.append(record)
-        selection_key = (metrics["balanced_accuracy"], -metrics["false_accept_count"])
+        selection_key = (metrics["balanced_accuracy"], -metrics["false_accept_count"], -metrics["loss"])
         if selection_key > best_key:
             best_key, best = selection_key, record
             atomic_save({
                 "phase": 2, "model_state_dict": model.state_dict(), "status_names": list(STATUS_NAMES),
                 "epoch": epoch, "validation": metrics, "phase1_checkpoint": manifest["phase1_checkpoint"],
                 "dataset_fingerprint": manifest["dataset_fingerprint"], "preprocessing": PREPROCESSING,
+                "training_config": manifest["training_config"],
             }, checkpoint_dir / "best.pt")
         print(f"Epoch {epoch:02d}/{epochs:02d} | train loss {record['train_loss']:.4f} | "
               f"val balanced accuracy {metrics['balanced_accuracy']:.2%} | "
+              f"val loss {metrics['loss']:.4f} | "
               f"false accepts {metrics['false_accept_count']} | false rejects {metrics['false_reject_count']}", flush=True)
+        if metrics["loss"] < lowest_loss - EARLY_STOPPING_MIN_DELTA:
+            lowest_loss = metrics["loss"]
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        if ENABLE_EARLY_STOPPING and not smoke_test and epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+            stopped_early = True
+            print(f"Early stopping: validation loss did not improve by {EARLY_STOPPING_MIN_DELTA:g} "
+                  f"for {EARLY_STOPPING_PATIENCE} epochs.", flush=True)
+            break
 
     if smoke_test:
         smoke_check(all(torch.equal(value, model.backbone.state_dict()[key].cpu())
@@ -172,6 +216,11 @@ def run_training(model, train_samples, val_samples, manifest, device, checkpoint
         "train_samples": len(train_samples), "validation_samples": len(val_samples),
         "validation_count_folders": manifest["validation_count_folders"],
         "phase1_checkpoint": manifest["phase1_checkpoint"], "sample_seed": manifest["sample_seed"],
+        "train_status_samples": {
+            name: sum(label == index for _, label in train_samples) for index, name in enumerate(STATUS_NAMES)
+        },
+        "training_config": manifest["training_config"],
+        "epochs_completed": len(history), "stopped_early": stopped_early,
         "device": str(device), "smoke_test": smoke_test,
     }
     atomic_save(history, results_dir / "training_history.json", as_json=True)
@@ -179,9 +228,14 @@ def run_training(model, train_samples, val_samples, manifest, device, checkpoint
     return summary
 
 
-def main(smoke_test: bool = False, phase1_checkpoint=None) -> dict:
-    if not smoke_test and NUM_EPOCHS < 1:
-        raise ValueError("NUM_EPOCHS must be positive.")
+def main(smoke_test: bool = False, phase1_checkpoint=None, checkpoint_dir=None, results_dir=None) -> dict:
+    for name in ("NUM_EPOCHS", "TRAIN_EMPTY_SAMPLES", "TRAIN_COUNT_SAMPLES_PER_CLASS",
+                 "BATCH_SIZE", "EARLY_STOPPING_PATIENCE"):
+        value = globals()[name]
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{name} must be a positive integer.")
+    if not math.isfinite(EARLY_STOPPING_MIN_DELTA) or EARLY_STOPPING_MIN_DELTA < 0:
+        raise ValueError("EARLY_STOPPING_MIN_DELTA must be finite and nonnegative.")
     source = resolve_path(PHASE1_CHECKPOINT if phase1_checkpoint is None else phase1_checkpoint)
     if not source.is_file():
         raise FileNotFoundError(f"Phase 1 checkpoint is missing: {source}. Run train_phase1.py first.")
@@ -192,16 +246,33 @@ def main(smoke_test: bool = False, phase1_checkpoint=None) -> dict:
     train_samples = collect_status_samples(train_root, validation=False, seed=SAMPLE_SEED)
     val_samples = collect_status_samples(val_root, validation=True, seed=SAMPLE_SEED)
     manifest = {
-        "schema_version": 1, "sample_seed": SAMPLE_SEED, "train_seed": TRAIN_SEED,
+        "schema_version": 2, "sample_seed": SAMPLE_SEED, "train_seed": TRAIN_SEED,
         "phase1_checkpoint": str(source), "status_names": list(STATUS_NAMES),
         "train_root": str(train_root), "validation_root": str(val_root),
-        "validation_count_folders": list(VALIDATION_COUNT_FOLDERS),
+        "validation_count_folders": sorted({path.relative_to(val_root).parts[0]
+                                            for path, label in val_samples if label == 0}),
+        "training_config": {
+            "num_epochs": NUM_EPOCHS, "batch_size": BATCH_SIZE,
+            "train_empty_samples": TRAIN_EMPTY_SAMPLES,
+            "train_count_samples_per_class": TRAIN_COUNT_SAMPLES_PER_CLASS,
+            "learning_rate": LEARNING_RATE, "weight_decay": WEIGHT_DECAY,
+            "sampling": "inverse_status_frequency_with_replacement",
+            "samples_per_epoch": len(train_samples), "validation_sampling": "all_available_images",
+            "best_selection": ["balanced_accuracy_desc", "false_accept_count_asc", "loss_asc"],
+            "early_stopping": ENABLE_EARLY_STOPPING, "early_stopping_monitor": "validation_loss",
+            "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+            "early_stopping_min_delta": EARLY_STOPPING_MIN_DELTA,
+        },
         "train_samples": {path.relative_to(train_root).as_posix(): STATUS_NAMES[label] for path, label in train_samples},
         "validation_samples": {path.relative_to(val_root).as_posix(): STATUS_NAMES[label] for path, label in val_samples},
         **inspect_image_splits(train_root, train_samples, val_root, val_samples),
     }
     print(f"Train: {len(train_samples)} images. Validation: {len(val_samples)} images "
-          f"(normal counts class0–class6). Device: {device}.", flush=True)
+          f"(all available images). Device: {device}.", flush=True)
+    print("Train status samples: " + ", ".join(
+        f"{name}={sum(label == index for _, label in train_samples)}"
+        for index, name in enumerate(STATUS_NAMES)
+    ) + "; equal expected sampling per status.", flush=True)
     if smoke_test:
         random.random()
         smoke_check(train_samples == collect_status_samples(train_root, validation=False, seed=SAMPLE_SEED)
@@ -212,12 +283,16 @@ def main(smoke_test: bool = False, phase1_checkpoint=None) -> dict:
             return run_training(model, train_samples, val_samples, manifest, device,
                                 temporary / "checkpoints", temporary / "results", smoke_test=True)
     return run_training(model, train_samples, val_samples, manifest, device,
-                        resolve_path(CHECKPOINT_DIR), resolve_path(RESULTS_DIR))
+                        resolve_path(CHECKPOINT_DIR if checkpoint_dir is None else checkpoint_dir),
+                        resolve_path(RESULTS_DIR if results_dir is None else results_dir))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--smoke-test", action="store_true", help="train one epoch and use temporary output directories")
     parser.add_argument("--phase1-checkpoint", help="override the Phase 1 best.pt path")
+    parser.add_argument("--checkpoint-dir", help="fresh output directory for checkpoints and data selection")
+    parser.add_argument("--results-dir", help="fresh output directory for training history and metrics")
     args = parser.parse_args()
-    main(smoke_test=args.smoke_test, phase1_checkpoint=args.phase1_checkpoint)
+    main(smoke_test=args.smoke_test, phase1_checkpoint=args.phase1_checkpoint,
+         checkpoint_dir=args.checkpoint_dir, results_dir=args.results_dir)
