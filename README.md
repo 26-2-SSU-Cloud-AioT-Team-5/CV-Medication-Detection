@@ -26,6 +26,15 @@ result = count_pills(image, 2)  # image: 통 전체 BGR (H, W, 3, uint8), 2: 뚜
 - 촬영 시각은 RPi SW가 관리한다. 이미지는 디스크에 저장하지 않는다.
 - image는 학습 사진과 같은 카메라 위치·해상도여야 한다 (ROI가 픽셀 좌표).
 
+## 칸 ROI 보정
+
+카메라나 통이 움직이면 통 전체를 다시 찍고 ROI를 새로 잡는다. (PC에서는 `pip install opencv-python` 필요)
+
+```bash
+python -m detector.calibrate 사진.jpg          # 칸 1→4 순서로 드래그 → Enter, 끝나면 Esc → config.yaml rois 저장
+python -m detector.calibrate 사진.jpg --show   # 지금 rois를 사진에 그려 <사진>_rois.jpg로 확인만
+```
+
 ## 모델 규격 (학습 → 배포)
 
 RPi 기기 내 추론은 ONNX Runtime을 쓴다. RPi OS는 64-bit여야 한다 (PyPI에 32-bit ARM용 `onnxruntime` 없음).
