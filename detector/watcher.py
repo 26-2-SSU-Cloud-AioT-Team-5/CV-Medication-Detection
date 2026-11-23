@@ -10,7 +10,7 @@ from typing import Optional
 
 import numpy as np
 
-from .interface import _check_image, _count, _crop, _load_config
+from .interface import _check_image, _count, _crop, _load_config, align_rois
 
 
 @dataclass
@@ -59,8 +59,9 @@ class PillboxWatcher:
         _check_image(image)
         w = self.cfg["watcher"]
         events = []
+        rois = align_rois(image, self.cfg)  # 통이 밀려도 매 사진 자동 보정
         for cid, c in self.compartments.items():
-            crop = _crop(image, self.cfg["rois"], cid)
+            crop = _crop(image, rois, cid)
             now_open = is_open(crop, w["dark_level"], w["open_dark_ratio"])
             if now_open:
                 count, conf = _count(self.cfg, crop)
