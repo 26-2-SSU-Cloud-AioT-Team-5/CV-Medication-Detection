@@ -352,16 +352,62 @@ while True:
 - `config.yaml`의 `model.path` 또는 해당 칸의 `rois`가 비어 있으면 `RuntimeError`
 - 이미지는 디스크에 저장하지 않는다. image는 ROI를 잡은 사진과 같은 카메라 위치·해상도여야 한다.
 
-### RPi 설치 / 속도 측정
+### RPi 가상환경 설정
 
-Raspberry Pi OS **64-bit** 기준 (32-bit에는 `onnxruntime`이 없음).
+Raspberry Pi OS **64-bit** 기준 (32-bit에는 `onnxruntime`이 없음). 저장소 루트(`~/CV-Medication-Detection`)에서 한 번만 한다.
 
 ```bash
 sudo apt install -y python3-picamera2            # 카메라 (apt로만 설치됨)
 python3 -m venv --system-site-packages .venv     # apt로 깐 picamera2를 venv에서 쓰기 위해
 . .venv/bin/activate
-pip install onnxruntime numpy Pillow PyYAML
+pip install onnxruntime Pillow PyYAML            # numpy는 설치하지 않는다 (아래 주의)
 ```
+
+- 새 터미널을 열 때마다 `. .venv/bin/activate`로 가상환경을 켠다 (프롬프트 앞에 `(.venv)`가 붙음).
+- **venv에 numpy를 따로 깔지 않는다.** picamera2는 시스템 numpy(apt)에 맞춰 빌드돼 있어 venv에 numpy 2.x가 들어가면 카메라가 깨질 수 있다.
+  `pip install opencv-python`도 numpy 2.x를 같이 깔기 때문에 Pi에는 설치하지 않는다 (ROI 수동 보정은 PC에서).
+  실수로 깔았다면 `pip uninstall -y opencv-python numpy`.
+- 모델 파일은 git에 없다. PC의 `models/phase2_best.onnx`를 Pi의 `models/`에 복사한다 (`scp` 또는 MobaXterm Sftp).
+- `.venv/`는 커밋하지 않는다 (`.gitignore`에 `.venv/` 추가). `git add .` 대신 파일 이름을 적어서 추가한다.
+
+### RPi 실기기 테스트
+
+가상환경을 켠 상태로 저장소 루트에서 실행한다. 둘 다 Ctrl+C로 끝낸다.
+
+**1. 개수 세기** — `python test_count.py`
+
+Enter를 누를 때마다 자동 초점 후 한 장 찍어 4칸의 개수와 처리 시간을 출력한다.
+
+```text
+1번 칸: 5개 (신뢰도 0.93)
+2번 칸: 닫힘/가림 (신뢰도 1.00)
+...
+4칸 처리 1.2초
+```
+
+확인할 것:
+
+- 칸마다 다른 개수(2~5개)를 넣었을 때 개수가 맞는지
+- 약통을 1~2 cm 밀어도 결과가 같은지 (ROI 자동 보정)
+- 닫은 칸이 `닫힘/가림`으로 나오는지
+- 4칸 처리 시간이 5초 안인지
+
+**2. 실제 동작 (watcher)** — `python test_watcher.py`
+
+약 1초마다 찍어 `PillboxWatcher.update`를 부른다. 뚜껑을 열고 4초 이상 두었다가 닫으면 그 칸의 이벤트가 출력된다.
+
+```text
+CountEvent(compartment_id=2, count=4, confidence=0.96, status='ok', captured_at=...)
+```
+
+너무 짧게 열었거나 손이 계속 가리면 `status='uncertain'`, `count=None`이 정상이다.
+
+틀린 결과가 나오면 `test_count.py`의 `img = cam.capture_array()` 다음 줄에
+`from PIL import Image; Image.fromarray(img[..., ::-1]).save("fail.jpg")`를 넣어 사진을 남긴다.
+
+> 스크립트는 `python - <<'EOF'`로 붙여 넣지 말고 파일로 실행한다. 표준 입력이 코드로 쓰여서 `input()`이 `EOFError`를 낸다.
+
+### 속도 측정
 
 모델이 아직 없으면 PC에서 랜덤 가중치 ONNX를 만들어 복사한다 (속도만 같고 개수는 의미 없음).
 
@@ -379,8 +425,14 @@ PC(데스크톱 CPU, 촬영 제외)에서는 약 210 ms였다.
 
 ### 칸 ROI 보정
 
-카메라나 통이 움직이면 통 전체를 다시 찍고 ROI를 새로 잡는다. (PC에서는 `pip install opencv-python` 필요)
-기준: 칸마다 **검은 바닥판을 딱 덮는 박스** (흰 벽은 거의 넣지 않음). 칸 번호는 사진 왼쪽부터 1~4.
+**자동 보정 (매 사진)**: `count_pills`와 `PillboxWatcher.update`는 크롭 전에 항상 `align_rois`를 거친다.
+`config.yaml`의 `rois` 주변(칸 크기의 ±20%)에서 검은 바닥판이 가장 꽉 차는 위치의 가운데로 박스를 옮긴다.
+뚜껑이 닫힌 칸은 옮기지 않는다. 알약을 넣다가 통이 1~2 cm 밀리는 정도는 따로 할 일이 없다.
+
+**수동 보정**: 카메라를 옮겼거나 통이 칸 크기의 20% 넘게 움직이면 뚜껑 4개를 모두 연 사진으로 ROI를 새로 잡는다.
+창이 떠야 하므로 SSH만 쓸 때는 사진을 PC로 옮겨 PC에서 돌리고(`pip install opencv-python` 필요), 바뀐 `config.yaml`을 Pi로 복사한다.
+기준: 칸마다 **검은 바닥판보다 조금 안쪽 박스** (흰 벽은 넣지 않음). 칸 번호는 사진 왼쪽부터 1~4.
+박스를 그리기 전에 사진 창을 한 번 클릭해야 Enter/Esc가 먹는다.
 
 ```bash
 python -m detector.calibrate 사진.jpg          # 칸 1→4 순서로 드래그 → Enter, 끝나면 Esc → config.yaml rois 저장
@@ -403,6 +455,6 @@ RPi 기기 내 추론은 ONNX Runtime을 쓴다. RPi OS는 64-bit여야 한다 (
 ### 남은 일
 
 - [x] 학습 파트에서 체크포인트 받기 → ONNX 변환 (Phase 2)
-- [ ] 칸별 ROI 좌표 재기 (학습 때 크롭 좌표가 저장되지 않음) → `config.yaml`의 `rois`
+- [x] 칸별 ROI 좌표 재기 → `config.yaml`의 `rois` (2026-11-23 카메라 위치, 매 사진 자동 보정)
 - [ ] 실제 RPi 사진으로 정확도 확인 (학습 검증은 합성 데이터만)
 - [x] RPi에서 추론 시간 측정 (랜덤 가중치: 1칸 열림 약 0.3초, 4칸 0.9초)
