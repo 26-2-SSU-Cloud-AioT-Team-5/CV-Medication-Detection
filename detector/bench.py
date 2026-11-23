@@ -4,7 +4,7 @@
     python -m detector.bench 모델.onnx --photos 열림.jpg 닫힘.jpg   # 실제 사진으로
     python -m detector.bench 모델.onnx --camera              # picamera2 촬영 시간도 측정
 
-모델이 아직 없으면 PC에서 `python -m training.export_onnx --random bench.onnx`로 만들어 복사한다
+모델이 아직 없으면 PC에서 `python -m training.export_onnx --random models/bench.onnx`로 만들어 복사한다
 (랜덤 가중치라 개수는 의미 없고 속도만 같다).
 """
 import argparse

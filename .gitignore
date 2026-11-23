@@ -19,3 +19,8 @@ __pycache__/
 
 /training/results/*
 !/training/results/.gitkeep
+
+# 로컬 전용
+.venv/
+/samples/
+/capture*.jpg

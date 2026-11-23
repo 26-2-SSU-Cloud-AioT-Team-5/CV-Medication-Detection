@@ -22,8 +22,13 @@ CV-Medication-Detection/
 │   ├── interface.py, model.py           # 칸 크롭, ONNX 추론
 │   ├── calibrate.py, bench.py           # ROI 보정, RPi 속도 측정
 │   └── config.yaml                      # 모델 경로, ROI, 판정 기준
-├── models/                              # 체크포인트, .onnx (git 제외)
-├── tests/
+├── models/                              # 체크포인트, .onnx, bench.onnx (git 제외)
+├── scripts/                             # RPi 실기기 확인용 (카메라 필요)
+│   ├── run_count.py                     # Enter마다 촬영 → 4칸 개수
+│   ├── run_watcher.py                   # 1초마다 촬영 → 닫힐 때 확정 이벤트
+│   └── run_rois.py                      # 촬영 → 자동 보정된 칸 박스 그림
+├── samples/                             # ROI·기준값 확인용 통 전체 사진 (git 제외)
+├── tests/                               # pytest 단위 테스트 (카메라 없이 PC에서)
 └── training/
     ├── export_onnx.py                   # 체크포인트 → RPi용 ONNX
     ├── dataset_sampler.py               # 이미지 로딩, 정규화, 샘플 선택 및 중복 검사
@@ -372,9 +377,10 @@ pip install onnxruntime Pillow PyYAML            # numpy는 설치하지 않는�
 
 ### RPi 실기기 테스트
 
-가상환경을 켠 상태로 저장소 루트에서 실행한다. 둘 다 Ctrl+C로 끝낸다.
+가상환경을 켠 상태로 저장소 루트에서 `python -m scripts.<이름>`으로 실행한다. Ctrl+C로 끝낸다.
+`tests/`의 파일은 pytest용 단위 테스트라 카메라 확인에 쓰지 않는다.
 
-**1. 개수 세기** — `python test_count.py`
+**1. 개수 세기** — `python -m scripts.run_count`
 
 Enter를 누를 때마다 자동 초점 후 한 장 찍어 4칸의 개수와 처리 시간을 출력한다.
 
@@ -392,7 +398,7 @@ Enter를 누를 때마다 자동 초점 후 한 장 찍어 4칸의 개수와 처
 - 닫은 칸이 `닫힘/가림`으로 나오는지
 - 4칸 처리 시간이 5초 안인지
 
-**2. 실제 동작 (watcher)** — `python test_watcher.py`
+**2. 실제 동작 (watcher)** — `python -m scripts.run_watcher`
 
 약 1초마다 찍어 `PillboxWatcher.update`를 부른다. 뚜껑을 열고 4초 이상 두었다가 닫으면 그 칸의 이벤트가 출력된다.
 
@@ -402,8 +408,13 @@ CountEvent(compartment_id=2, count=4, confidence=0.96, status='ok', captured_at=
 
 너무 짧게 열었거나 손이 계속 가리면 `status='uncertain'`, `count=None`이 정상이다.
 
-틀린 결과가 나오면 `test_count.py`의 `img = cam.capture_array()` 다음 줄에
+틀린 결과가 나오면 `scripts/run_count.py`의 `img = cam.capture_array()` 다음 줄에
 `from PIL import Image; Image.fromarray(img[..., ::-1]).save("fail.jpg")`를 넣어 사진을 남긴다.
+
+**3. 칸 박스 확인** — `python -m scripts.run_rois`
+
+한 장 찍어 자동 보정된 박스를 그린 `capture_rois.jpg`와 원본 `capture.jpg`를 저장하고 칸별 이동량을 출력한다.
+박스가 검은 바닥판 안에 있으면 정상이다.
 
 > 스크립트는 `python - <<'EOF'`로 붙여 넣지 말고 파일로 실행한다. 표준 입력이 코드로 쓰여서 `input()`이 `EOFError`를 낸다.
 
@@ -412,12 +423,12 @@ CountEvent(compartment_id=2, count=4, confidence=0.96, status='ok', captured_at=
 모델이 아직 없으면 PC에서 랜덤 가중치 ONNX를 만들어 복사한다 (속도만 같고 개수는 의미 없음).
 
 ```bash
-python -m training.export_onnx --random bench.onnx   # PC (torch 필요)
-scp bench.onnx pi@<약통 Pi>:~/CV-Medication-Detection/
+python -m training.export_onnx --random models/bench.onnx   # PC (torch 필요)
+scp models/bench.onnx pi@<약통 Pi>:~/CV-Medication-Detection/models/
 ```
 
 ```bash
-python -m detector.bench bench.onnx --camera     # RPi: 촬영 + 크롭 + 추론 시간, CPU 온도
+python -m detector.bench models/bench.onnx --camera     # RPi: 촬영 + 크롭 + 추론 시간, CPU 온도
 ```
 
 `최악 1회(촬영 + 4칸 열림 update)`가 1000 ms 안이면 1초 간격 호출이 가능하다.

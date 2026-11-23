@@ -8,7 +8,7 @@ ImageNet 정규화를 모델 안에 넣어 detector/model.py 규격(RGB 0~1 입�
 
 사용 (학습 환경, torch/torchvision/onnxruntime 필요):
     python -m training.export_onnx training/checkpoints/<파일>.pt
-    python -m training.export_onnx --random bench.onnx   # 가중치 없이 RPi 속도 측정용
+    python -m training.export_onnx --random models/bench.onnx   # 가중치 없이 RPi 속도 측정용
 결과는 체크포인트 옆 .onnx. 그 경로를 detector/config.yaml의 model.path에 적는다.
 """
 
